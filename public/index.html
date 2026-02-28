@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>syncd</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='%2334d399'/><stop offset='100%' stop-color='%23059669'/></linearGradient></defs><rect width='100' height='100' rx='20' fill='%230c0f16'/><path d='M65 35a20 20 0 01-30 17.3' stroke='url(%23g)' stroke-width='7' stroke-linecap='round' fill='none'/><path d='M35 65a20 20 0 0130-17.3' stroke='url(%23g)' stroke-width='7' stroke-linecap='round' fill='none'/><polygon points='38,46 28,52 38,58' fill='%2334d399'/><polygon points='62,42 72,48 62,54' fill='%2334d399'/></svg>">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #0c0f16;
+      --surface: #151a24;
+      --surface-2: #1c2333;
+      --surface-3: #232b3b;
+      --accent: #34d399;
+      --accent-dim: #065f46;
+      --accent-glow: rgba(52, 211, 153, 0.12);
+      --text: #e2e8f0;
+      --text-2: #94a3b8;
+      --text-3: #475569;
+      --border: #1e293b;
+      --error: #f87171;
+      --error-bg: rgba(248, 113, 113, 0.08);
+      --error-border: rgba(248, 113, 113, 0.2);
+      --radius: 12px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100dvh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      -webkit-font-smoothing: antialiased;
+      overflow: hidden;
+    }
+
+    /* Subtle background pattern */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 600px 400px at 50% 0%, rgba(52, 211, 153, 0.03), transparent),
+        radial-gradient(ellipse 400px 300px at 80% 100%, rgba(52, 211, 153, 0.02), transparent);
+      pointer-events: none;
+    }
+
+    .container {
+      max-width: 400px;
+      width: 100%;
+      padding: 1.75rem;
+      position: relative;
+      z-index: 1;
+    }
+
+    /* Screen transitions */
+    .screen { display: none; opacity: 0; }
+    .screen.active {
+      display: block;
+      animation: screenIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+    @keyframes screenIn {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Logo */
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin-bottom: 0.5rem;
+    }
+    .logo-icon {
+      width: 32px; height: 32px;
+      background: linear-gradient(135deg, var(--accent), #059669);
+      border-radius: 9px;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 0 20px var(--accent-glow);
+    }
+    .logo-icon svg { width: 17px; height: 17px; }
+    .logo-text {
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: #fff;
+    }
+    .subtitle {
+      color: var(--text-3);
+      font-size: 0.82rem;
+      margin-bottom: 1.5rem;
+      line-height: 1.5;
+    }
+
+    /* Status pill */
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0.45rem 0.8rem;
+      border-radius: 20px;
+      font-size: 0.8rem;
+      font-weight: 500;
+      margin-bottom: 1.25rem;
+      transition: all 0.3s ease;
+    }
+    .status-pill.waiting {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text-2);
+    }
+    .status-pill.working {
+      background: var(--accent-glow);
+      border: 1px solid rgba(52, 211, 153, 0.2);
+      color: var(--accent);
+    }
+    .status-pill.success {
+      background: rgba(52, 211, 153, 0.1);
+      border: 1px solid rgba(52, 211, 153, 0.25);
+      color: var(--accent);
+    }
+    .status-pill.error {
+      background: var(--error-bg);
+      border: 1px solid var(--error-border);
+      color: var(--error);
+    }
+    .status-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+      flex-shrink: 0;
+    }
+    .status-pill.working .status-dot {
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    /* PIN Input */
+    .pin-group {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      margin: 1.25rem 0 1.5rem;
+    }
+    .pin-input {
+      width: 44px; height: 48px;
+      text-align: center;
+      font-size: 1.25rem;
+      font-weight: 700;
+      font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+      background: var(--surface);
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
+      color: #fff;
+      outline: none;
+      transition: all 0.2s ease;
+      caret-color: var(--accent);
+    }
+    .pin-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+      background: var(--surface-2);
+    }
+    .pin-input.filled {
+      border-color: rgba(52, 211, 153, 0.4);
+      background: rgba(52, 211, 153, 0.05);
+      color: var(--accent);
+    }
+    .pin-input.shake { animation: shake 0.4s ease; }
+    @keyframes shake {
+      20%, 60% { transform: translateX(-4px); }
+      40%, 80% { transform: translateX(4px); }
+    }
+
+    /* Buttons */
+    .btn {
+      width: 100%;
+      padding: 0.8rem;
+      border: none;
+      border-radius: 10px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      letter-spacing: -0.01em;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), #059669);
+      color: #fff;
+      box-shadow: 0 2px 12px var(--accent-glow);
+    }
+    .btn-primary:hover {
+      box-shadow: 0 4px 20px rgba(52, 211, 153, 0.2);
+      transform: translateY(-1px);
+    }
+    .btn-primary:active { transform: translateY(0); }
+    .btn-primary:disabled {
+      background: var(--surface-2);
+      color: var(--text-3);
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+
+    /* Main screen header */
+    .main-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1.25rem;
+    }
+    .main-header .logo { margin-bottom: 0; }
+    .conn-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 0.3rem 0.6rem;
+      border-radius: 16px;
+      font-size: 0.72rem;
+      font-weight: 500;
+      background: rgba(52, 211, 153, 0.08);
+      border: 1px solid rgba(52, 211, 153, 0.15);
+      color: var(--accent);
+    }
+    .conn-dot {
+      width: 5px; height: 5px;
+      background: var(--accent);
+      border-radius: 50%;
+      box-shadow: 0 0 6px var(--accent);
+    }
+
+    /* Section header */
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 0.75rem;
+      padding: 0 0.25rem;
+    }
+    .section-title {
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-3);
+    }
+    .refresh-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-3);
+      width: 30px; height: 30px;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+    }
+    .refresh-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: var(--accent-glow);
+    }
+    .refresh-btn:active { transform: scale(0.92); }
+    .refresh-btn.spinning svg { animation: spin 0.6s linear; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* File List */
+    .file-list { list-style: none; }
+    .file-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.7rem 0.85rem;
+      background: var(--surface);
+      border-radius: var(--radius);
+      margin-bottom: 6px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      border: 1px solid transparent;
+    }
+    .file-item:hover {
+      background: var(--surface-2);
+      border-color: var(--border);
+    }
+    .file-item:active { transform: scale(0.985); }
+    .file-item.downloading { opacity: 0.5; pointer-events: none; }
+    .file-item.dir-item {
+      cursor: default;
+      background: transparent;
+      padding: 0.4rem 0.5rem;
+      margin-bottom: 2px;
+    }
+    .file-item.dir-item:hover { background: transparent; border-color: transparent; }
+    .file-name {
+      font-size: 0.85rem;
+      font-weight: 500;
+      word-break: break-all;
+      color: var(--text);
+    }
+    .file-meta {
+      color: var(--text-3);
+      font-size: 0.72rem;
+      margin-top: 2px;
+    }
+    .file-dl {
+      color: var(--accent);
+      font-size: 0.8rem;
+      font-weight: 500;
+      white-space: nowrap;
+      margin-left: 1rem;
+      opacity: 0.7;
+      transition: opacity 0.15s;
+    }
+    .file-item:hover .file-dl { opacity: 1; }
+    .dir-name {
+      color: var(--text-3);
+      font-size: 0.72rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .indent-1 { margin-left: 1.25rem; }
+    .indent-2 { margin-left: 2.5rem; }
+    .indent-3 { margin-left: 3.75rem; }
+
+    .loading {
+      text-align: center;
+      color: var(--text-3);
+      padding: 2.5rem 1rem;
+      font-size: 0.82rem;
+    }
+    .empty-state {
+      text-align: center;
+      padding: 3rem 1rem;
+      color: var(--text-3);
+      font-size: 0.82rem;
+      line-height: 1.6;
+    }
+    .empty-icon {
+      font-size: 2rem;
+      margin-bottom: 0.75rem;
+      opacity: 0.4;
+      filter: grayscale(0.5);
+    }
+
+    /* Toast */
+    .toast-container {
+      position: fixed;
+      top: 1rem;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 999;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .toast {
+      padding: 0.55rem 1rem;
+      border-radius: 20px;
+      font-size: 0.78rem;
+      font-weight: 500;
+      backdrop-filter: blur(12px);
+      animation: toastIn 0.3s ease, toastOut 0.3s ease 2.5s forwards;
+      max-width: 280px;
+      text-align: center;
+    }
+    .toast.ok {
+      background: rgba(52, 211, 153, 0.12);
+      border: 1px solid rgba(52, 211, 153, 0.2);
+      color: var(--accent);
+    }
+    .toast.err {
+      background: var(--error-bg);
+      border: 1px solid var(--error-border);
+      color: var(--error);
+    }
+    .toast.info {
+      background: rgba(148, 163, 184, 0.1);
+      border: 1px solid rgba(148, 163, 184, 0.15);
+      color: var(--text-2);
+    }
+    @keyframes toastIn {
+      from { opacity: 0; transform: translateY(-8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes toastOut {
+      to { opacity: 0; transform: translateY(-8px); }
+    }
+</style>
+</head>
+<body>
+  <div class="toast-container" id="toasts"></div>
+  <div class="container">
+    <div id="pair-screen" class="screen">
+      <div class="logo">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+          </svg>
+        </div>
+        <span class="logo-text">syncd</span>
+      </div>
+      <p class="subtitle">输入配对 PIN 码，建立端到端加密连接</p>
+      <div id="pair-status" class="status-pill waiting">
+        <span class="status-dot"></span>
+        <span id="pair-status-text">等待输入 PIN 码</span>
+      </div>
+      <div class="pin-group" id="pin-group">
+        <input class="pin-input" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+        <input class="pin-input" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+        <input class="pin-input" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+        <input class="pin-input" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+        <input class="pin-input" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+        <input class="pin-input" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off">
+      </div>
+      <button id="pair-btn" class="btn btn-primary" disabled>配对</button>
+    </div>
+    <div id="main-screen" class="screen">
+      <div class="main-header">
+        <div class="logo">
+          <div class="logo-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+            </svg>
+          </div>
+          <span class="logo-text">syncd</span>
+        </div>
+        <span class="conn-badge"><span class="conn-dot"></span>已加密</span>
+      </div>
+      <div class="section-header">
+        <span class="section-title">共享文件</span>
+        <button class="refresh-btn" id="refresh-files-btn" onclick="loadFiles()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M23 4v6h-6"/><path d="M1 20v-6h6"/>
+            <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
+          </svg>
+        </button>
+      </div>
+      <ul class="file-list" id="file-list">
+        <li class="loading">加载中...</li>
+      </ul>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
