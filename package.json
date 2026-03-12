@@ -1,7 +1,7 @@
 {
-  "name": "syncd",
+  "name": "cloudsysncd",
   "version": "1.0.0",
-  "description": "",
+  "description": "Encrypted file sync and share service with PIN pairing and Cloudflare Tunnel support.",
   "main": "index.js",
   "scripts": {
     "start": "node server.js",
@@ -14,7 +14,7 @@
   "type": "commonjs",
   "dependencies": {
     "express": "^5.2.1",
-    "tar": "^7.5.9"
+    "tar": "^7.5.11"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"

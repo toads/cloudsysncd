@@ -2,19 +2,25 @@ const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const zlib = require('zlib');
 const { pipeline } = require('stream');
 const tar = require('tar');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = Buffer.from(buf);
+  },
+}));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const MAX_TEXTS = 100;
 const TEXT_EXPIRY_MS = 24 * 60 * 60 * 1000;
-const CHUNK_SIZE = 1024 * 1024;
 const MAX_CONCURRENT_DOWNLOADS = 3;
+const REQUEST_AUTH_WINDOW_MS = 5 * 60 * 1000;
+const REQUEST_NONCE_TTL_MS = 10 * 60 * 1000;
+const MAX_NONCES_PER_DEVICE = 512;
 let activeDownloads = 0;
+const seenRequestNonces = new Map();
 
 const DATA_DIR = path.join(__dirname, 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
@@ -80,6 +86,112 @@ function hmac(key, data) {
   return crypto.createHmac('sha256', key).update(data).digest('hex');
 }
 
+function sha256Hex(data) {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+function deriveRequestAuthKey(deviceId) {
+  return Buffer.from(hkdf(masterKey, 'syncd-request-auth', `device:${deviceId}`, 32));
+}
+
+function safeEqualHex(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  if (left.length !== right.length || left.length % 2 !== 0) return false;
+  try {
+    const leftBuf = Buffer.from(left, 'hex');
+    const rightBuf = Buffer.from(right, 'hex');
+    return leftBuf.length === rightBuf.length && crypto.timingSafeEqual(leftBuf, rightBuf);
+  } catch {
+    return false;
+  }
+}
+
+function buildRequestSignatureMessage(method, originalUrl, timestamp, nonce, bodyHash) {
+  return [method.toUpperCase(), originalUrl, timestamp, nonce, bodyHash].join('\n');
+}
+
+function pruneSeenNonces(now = Date.now()) {
+  for (const [deviceId, entries] of seenRequestNonces.entries()) {
+    for (const [nonce, seenAt] of entries.entries()) {
+      if (now - seenAt > REQUEST_NONCE_TTL_MS) {
+        entries.delete(nonce);
+      }
+    }
+    if (entries.size === 0) {
+      seenRequestNonces.delete(deviceId);
+    }
+  }
+}
+
+function hasSeenNonce(deviceId, nonce) {
+  const entries = seenRequestNonces.get(deviceId);
+  return !!entries && entries.has(nonce);
+}
+
+function rememberNonce(deviceId, nonce, now = Date.now()) {
+  let entries = seenRequestNonces.get(deviceId);
+  if (!entries) {
+    entries = new Map();
+    seenRequestNonces.set(deviceId, entries);
+  }
+
+  entries.set(nonce, now);
+  if (entries.size <= MAX_NONCES_PER_DEVICE) return;
+
+  const overflow = entries.size - MAX_NONCES_PER_DEVICE;
+  let removed = 0;
+  for (const key of entries.keys()) {
+    entries.delete(key);
+    removed++;
+    if (removed >= overflow) break;
+  }
+}
+
+function requireDeviceAuth(req, res, next) {
+  if (devices.length === 0) return res.status(403).json({ error: 'Not paired' });
+
+  const deviceId = req.headers['x-device-id'];
+  const timestamp = req.headers['x-auth-timestamp'];
+  const nonce = req.headers['x-auth-nonce'];
+  const signature = req.headers['x-auth-signature'];
+  if (!deviceId || !timestamp || !nonce || !signature) {
+    return res.status(401).json({ error: 'Missing request authentication headers' });
+  }
+
+  const device = devices.find((entry) => entry.id === deviceId);
+  if (!device) {
+    return res.status(401).json({ error: 'Unknown device' });
+  }
+
+  const timestampMs = Number(timestamp);
+  if (!Number.isFinite(timestampMs)) {
+    return res.status(401).json({ error: 'Invalid request timestamp' });
+  }
+
+  const now = Date.now();
+  if (Math.abs(now - timestampMs) > REQUEST_AUTH_WINDOW_MS) {
+    return res.status(401).json({ error: 'Request timestamp expired' });
+  }
+
+  pruneSeenNonces(now);
+  if (hasSeenNonce(deviceId, nonce)) {
+    return res.status(409).json({ error: 'Replay detected' });
+  }
+
+  const bodyHash = sha256Hex(req.rawBody || Buffer.alloc(0));
+  const expectedSignature = hmac(
+    deriveRequestAuthKey(deviceId),
+    buildRequestSignatureMessage(req.method, req.originalUrl, String(timestamp), String(nonce), bodyHash)
+  );
+  if (!safeEqualHex(expectedSignature, signature)) {
+    return res.status(401).json({ error: 'Invalid request signature' });
+  }
+
+  rememberNonce(deviceId, nonce, now);
+  req.authenticatedDeviceId = deviceId;
+  next();
+}
+
 function encrypt(key, plaintext) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -94,10 +206,57 @@ function createEncryptStream(key) {
   return { cipher, iv };
 }
 
-function decrypt(key, ivHex, ciphertextHex, tagHex) {
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex'));
-  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
-  return Buffer.concat([decipher.update(Buffer.from(ciphertextHex, 'hex')), decipher.final()]);
+function streamEncryptedResponse({ res, sourceStream, extraHeaders = {}, label, onComplete }) {
+  const { cipher, iv } = createEncryptStream(masterKey);
+  let completed = false;
+
+  const finish = (err) => {
+    if (completed) return;
+    completed = true;
+    if (onComplete) onComplete(err);
+  };
+
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Encrypted-IV', iv.toString('hex'));
+  res.setHeader('X-Encrypted-Tag-Length', '16');
+
+  for (const [header, value] of Object.entries(extraHeaders)) {
+    res.setHeader(header, value);
+  }
+
+  cipher.pipe(res, { end: false });
+
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    const err = new Error('Client disconnected');
+    sourceStream.destroy(err);
+    cipher.destroy(err);
+    finish(err);
+  });
+
+  pipeline(sourceStream, cipher, (err) => {
+    if (completed) return;
+    if (err) {
+      console.error(`[${label}] Stream error:`, err.message);
+      finish(err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: `${label} failed` });
+      } else if (!res.destroyed) {
+        res.destroy(err);
+      }
+      return;
+    }
+
+    try {
+      const tag = cipher.getAuthTag();
+      res.end(tag, () => finish());
+    } catch (tagErr) {
+      console.error(`[${label}] Finalize error:`, tagErr.message);
+      finish(tagErr);
+      if (!res.destroyed) res.destroy(tagErr);
+    }
+  });
 }
 
 // ============ Pending Pairing Session ============
@@ -164,7 +323,13 @@ app.post('/api/pair/verify', (req, res) => {
     const serverProof = hmac(authKey, 'server-confirmed');
 
     const id = deviceId || 'unknown';
-    devices.push({ id, pairedAt: new Date().toISOString() });
+    const pairedAt = new Date().toISOString();
+    const existingDevice = devices.find((entry) => entry.id === id);
+    if (existingDevice) {
+      existingDevice.pairedAt = pairedAt;
+    } else {
+      devices.push({ id, pairedAt });
+    }
     persistDevices();
     pendingPair = null; // Invalidate PIN
 
@@ -208,16 +373,13 @@ function walkDir(dir, prefix = '') {
   return results;
 }
 
-app.get('/api/files', (req, res) => {
-  if (devices.length === 0) return res.status(403).json({ error: 'Not paired' });
+app.get('/api/files', requireDeviceAuth, (req, res) => {
   if (!fs.existsSync(sharedDir)) fs.mkdirSync(sharedDir, { recursive: true });
   const tree = walkDir(sharedDir);
   res.json({ encrypted: encrypt(masterKey, Buffer.from(JSON.stringify(tree))) });
 });
 
-app.get(/^\/api\/files\/(.*)/, (req, res) => {
-  if (devices.length === 0) return res.status(403).json({ error: 'Not paired' });
-  
+app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
   const relPath = req.params[0] || '';
   const filePath = path.resolve(path.join(sharedDir, relPath));
   if (!filePath.startsWith(path.resolve(sharedDir))) return res.status(403).json({ error: 'Access denied' });
@@ -229,51 +391,25 @@ app.get(/^\/api\/files\/(.*)/, (req, res) => {
   if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
     return res.status(503).json({ error: 'Too many concurrent downloads. Please try again later.' });
   }
-  
-  if (fileSize > CHUNK_SIZE) {
-    activeDownloads++;
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('X-File-Size', fileSize);
-    
-    const { cipher, iv } = createEncryptStream(masterKey);
-    const fileStream = fs.createReadStream(filePath);
-    
-    let chunks = [];
-    cipher.on('data', chunk => chunks.push(chunk));
-    
-    pipeline(fileStream, cipher, (err) => {
+
+  activeDownloads++;
+  streamEncryptedResponse({
+    res,
+    sourceStream: fs.createReadStream(filePath),
+    label: 'FILE',
+    extraHeaders: {
+      'X-File-Name': encodeURIComponent(path.basename(relPath)),
+      'X-File-Size': String(fileSize),
+    },
+    onComplete: () => {
       activeDownloads--;
-      if (err) {
-        console.error('[FILE] Stream error:', err.message);
-        if (!res.headersSent) res.status(500).json({ error: 'Encryption failed' });
-        return;
-      }
-      
-      const encrypted = Buffer.concat(chunks);
-      const tag = cipher.getAuthTag();
-      res.json({
-        encrypted: {
-          iv: iv.toString('hex'),
-          ciphertext: encrypted.toString('hex'),
-          tag: tag.toString('hex'),
-          filename: path.basename(relPath),
-          size: fileSize
-        }
-      });
-    });
-  } else {
-    const content = fs.readFileSync(filePath);
-    const enc = encrypt(masterKey, content);
-    enc.filename = path.basename(relPath);
-    enc.size = content.length;
-    res.json({ encrypted: enc });
-  }
+    },
+  });
 });
 
 // ============ Batch Download ============
 
-app.get('/api/batch', (req, res) => {
-  if (devices.length === 0) return res.status(403).json({ error: 'Not paired' });
+app.get('/api/batch', requireDeviceAuth, (req, res) => {
   if (!fs.existsSync(sharedDir)) fs.mkdirSync(sharedDir, { recursive: true });
 
   const since = req.query.since ? new Date(req.query.since) : null;
@@ -288,7 +424,7 @@ app.get('/api/batch', (req, res) => {
   }
 
   if (files.length === 0) {
-    return res.json({ encrypted: null, count: 0, totalSize: 0 });
+    return res.status(204).end();
   }
 
   if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
@@ -296,31 +432,17 @@ app.get('/api/batch', (req, res) => {
   }
 
   activeDownloads++;
-  const { cipher, iv } = createEncryptStream(masterKey);
-  const tarStream = tar.create({ gzip: true, cwd: sharedDir }, files);
-  
-  let chunks = [];
-  cipher.on('data', chunk => chunks.push(chunk));
-  
-  pipeline(tarStream, cipher, (err) => {
-    activeDownloads--;
-    if (err) {
-      console.error('[BATCH] Stream error:', err.message);
-      if (!res.headersSent) res.status(500).json({ error: 'Archive failed' });
-      return;
-    }
-    
-    const encrypted = Buffer.concat(chunks);
-    const tag = cipher.getAuthTag();
-    res.json({
-      encrypted: {
-        iv: iv.toString('hex'),
-        ciphertext: encrypted.toString('hex'),
-        tag: tag.toString('hex')
-      },
-      count: files.length,
-      totalSize
-    });
+  streamEncryptedResponse({
+    res,
+    sourceStream: tar.create({ gzip: true, cwd: sharedDir }, files),
+    label: 'BATCH',
+    extraHeaders: {
+      'X-Batch-Count': String(files.length),
+      'X-Batch-Total-Size': String(totalSize),
+    },
+    onComplete: () => {
+      activeDownloads--;
+    },
   });
 });
 
@@ -337,8 +459,7 @@ function cleanExpiredTexts() {
   }
 }
 
-app.post('/api/text', (req, res) => {
-  if (devices.length === 0) return res.status(403).json({ error: 'Not paired' });
+app.post('/api/text', requireDeviceAuth, (req, res) => {
   const { encryptedText } = req.body;
   if (!encryptedText) return res.status(400).json({ error: 'Missing encryptedText' });
   
@@ -353,8 +474,7 @@ app.post('/api/text', (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/api/texts', (req, res) => {
-  if (devices.length === 0) return res.status(403).json({ error: 'Not paired' });
+app.get('/api/texts', requireDeviceAuth, (req, res) => {
   cleanExpiredTexts();
   res.json({ texts: sharedTexts });
 });
@@ -363,7 +483,7 @@ app.get('/api/texts', (req, res) => {
 
 const PORT = process.env.PORT || 21891;
 app.listen(PORT, () => {
-  console.log(`syncd server running on http://localhost:${PORT}`);
+  console.log(`cloudsysncd server running on http://localhost:${PORT}`);
   console.log(`Shared directory: ${sharedDir}`);
   console.log(`Paired devices: ${devices.length}`);
   if (devices.length === 0) {

@@ -1,4 +1,11 @@
 node_modules/
 data/
 .DS_Store
+.claude/
 __pycache__/
+.syncd_state.json
+.syncd_key
+
+# Runtime shared payloads and local audit artifacts.
+shared/*
+!shared/sync_download.py
