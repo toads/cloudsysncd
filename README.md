@@ -4,6 +4,8 @@
 
 当前版本更适合受信任网络内使用，不适合未经加固直接暴露到公网。开源发布前请先阅读 [OPEN_SOURCE_AUDIT.md](./OPEN_SOURCE_AUDIT.md)。
 
+项目后续增强计划见 [ROADMAP.md](./ROADMAP.md)。
+
 ## 功能
 
 - 浏览器端 PIN 配对
