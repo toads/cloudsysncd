@@ -111,6 +111,17 @@ function buildRequestSignatureMessage(method, originalUrl, timestamp, nonce, bod
   return [method.toUpperCase(), originalUrl, timestamp, nonce, bodyHash].join('\n');
 }
 
+function parseSinceCursor(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (/^\d+$/.test(String(value))) {
+    const timestampMs = Number(value);
+    return Number.isFinite(timestampMs) ? timestampMs : null;
+  }
+
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function pruneSeenNonces(now = Date.now()) {
   for (const [deviceId, entries] of seenRequestNonces.entries()) {
     for (const [nonce, seenAt] of entries.entries()) {
@@ -285,6 +296,10 @@ app.get('/api/status', (req, res) => {
   res.json({ paired: devices.length > 0 });
 });
 
+app.get('/api/session', requireDeviceAuth, (req, res) => {
+  res.json({ ok: true, deviceId: req.authenticatedDeviceId });
+});
+
 app.get('/healthz', (req, res) => {
   res.json({
     ok: true,
@@ -424,13 +439,15 @@ app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
 app.get('/api/batch', requireDeviceAuth, (req, res) => {
   if (!fs.existsSync(sharedDir)) fs.mkdirSync(sharedDir, { recursive: true });
 
-  const since = req.query.since ? new Date(req.query.since) : null;
+  const sinceMs = parseSinceCursor(req.query.since);
+  const snapshotStartedAt = Date.now();
 
   const files = [];
   let totalSize = 0;
   for (const entry of walkDir(sharedDir)) {
     if (entry.type !== 'file') continue;
-    if (since && new Date(entry.modified) <= since) continue;
+    const modifiedMs = Date.parse(entry.modified);
+    if (sinceMs !== null && Number.isFinite(modifiedMs) && modifiedMs <= sinceMs) continue;
     files.push(entry.name);
     totalSize += entry.size;
   }
@@ -451,6 +468,7 @@ app.get('/api/batch', requireDeviceAuth, (req, res) => {
     extraHeaders: {
       'X-Batch-Count': String(files.length),
       'X-Batch-Total-Size': String(totalSize),
+      'X-Batch-Snapshot-At': String(snapshotStartedAt),
     },
     onComplete: () => {
       activeDownloads--;

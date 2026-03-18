@@ -78,17 +78,24 @@ function safeDecodeHeader(value) {
   }
 }
 
+const MAX_BROWSER_DOWNLOAD_BYTES = 64 * 1024 * 1024;
+
 async function decryptDownloadResponse(res) {
   const streamIv = res.headers.get('x-encrypted-iv');
   if (streamIv) {
+    const declaredSize = Number.parseInt(res.headers.get('x-file-size') || '0', 10);
+    if (Number.isFinite(declaredSize) && declaredSize > MAX_BROWSER_DOWNLOAD_BYTES) {
+      throw new Error(`浏览器下载暂不支持超过 ${formatSize(MAX_BROWSER_DOWNLOAD_BYTES)} 的单文件，请改用 Python CLI`);
+    }
+
     const tagLength = Number.parseInt(res.headers.get('x-encrypted-tag-length') || '16', 10);
     const payload = new Uint8Array(await res.arrayBuffer());
     if (payload.length < tagLength) {
       throw new Error('Encrypted payload is truncated');
     }
 
-    const ciphertext = payload.slice(0, payload.length - tagLength);
-    const tag = payload.slice(payload.length - tagLength);
+    const ciphertext = payload.subarray(0, payload.length - tagLength);
+    const tag = payload.subarray(payload.length - tagLength);
     const plainBuf = await Crypto.decryptBytes(encryptionKey, hex2buf(streamIv), ciphertext, tag);
 
     return {
@@ -140,6 +147,15 @@ const KeyStore = {
       req.onerror = () => reject(req.error);
     });
   },
+  async delete(key) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.STORE_NAME, 'readwrite');
+      tx.objectStore(this.STORE_NAME).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  },
 };
 
 // ============ Toast Notifications ============
@@ -158,6 +174,9 @@ function toast(msg, type = 'info') {
 let encryptionKey = null;
 let deviceId = null;
 let fileRefreshTimer = null;
+let scrollLoaderObserver = null;
+let scrollLoaderTimer = null;
+let authResetPromise = null;
 
 function showScreen(id) {
   document.querySelectorAll('.screen').forEach(s => {
@@ -178,11 +197,98 @@ function showMainScreen() {
 function showPairScreen() {
   showScreen('pair-screen');
   if (fileRefreshTimer) { clearInterval(fileRefreshTimer); fileRefreshTimer = null; }
+  teardownScrollLoader();
 }
 
 function buildSignedPath(pathname) {
   const url = new URL(pathname, window.location.origin);
   return url.pathname + url.search;
+}
+
+function teardownScrollLoader() {
+  if (scrollLoaderObserver) {
+    scrollLoaderObserver.disconnect();
+    scrollLoaderObserver = null;
+  }
+  if (scrollLoaderTimer) {
+    clearInterval(scrollLoaderTimer);
+    scrollLoaderTimer = null;
+  }
+}
+
+async function resetStoredSession(message = '本地配对已失效，请重新输入 PIN') {
+  if (authResetPromise) return authResetPromise;
+
+  authResetPromise = (async () => {
+    encryptionKey = null;
+    deviceId = null;
+    showPairScreen();
+
+    selectedFiles.clear();
+    selectionMode = false;
+    document.getElementById('file-list')?.classList.remove('selection-mode');
+    selectionBar?.classList.remove('active');
+    topSelectionBar?.classList.remove('active');
+    if (toggleSelectionModeBtn) toggleSelectionModeBtn.textContent = '选择';
+    if (selectionCountEl) selectionCountEl.textContent = '0';
+    const topSelectionText = document.getElementById('top-selection-text');
+    if (topSelectionText) topSelectionText.textContent = '选择文件';
+
+    document.querySelectorAll('.pin-input').forEach((input) => {
+      input.value = '';
+      input.classList.remove('filled', 'shake');
+    });
+    document.getElementById('pair-btn').disabled = true;
+
+    await Promise.all([
+      KeyStore.delete('encryptionKey'),
+      KeyStore.delete('deviceId'),
+    ]);
+
+    setStatus('error', message);
+    toast(message, 'err');
+    setTimeout(() => document.querySelector('.pin-input')?.focus(), 100);
+  })().finally(() => {
+    authResetPromise = null;
+  });
+
+  return authResetPromise;
+}
+
+async function maybeHandleAuthFailure(res) {
+  if (![401, 403].includes(res.status)) return false;
+
+  let errorMessage = '';
+  try {
+    const bodyText = await res.clone().text();
+    if (bodyText) {
+      try {
+        errorMessage = JSON.parse(bodyText).error || bodyText.slice(0, 120);
+      } catch {
+        errorMessage = bodyText.slice(0, 120);
+      }
+    }
+  } catch {
+    errorMessage = '';
+  }
+
+  const resettableErrors = new Set([
+    'Unknown device',
+    'Invalid request signature',
+    'Missing request authentication headers',
+    'Not paired',
+  ]);
+
+  if (resettableErrors.has(errorMessage)) {
+    await resetStoredSession(errorMessage || '本地配对已失效，请重新输入 PIN');
+    return true;
+  }
+
+  if (errorMessage === 'Request timestamp expired') {
+    toast('设备时间偏差过大，请校准系统时间后重试', 'err');
+  }
+
+  return false;
 }
 
 async function deriveRequestAuthKey() {
@@ -220,7 +326,9 @@ async function apiFetch(pathname, options = {}) {
   headers.set('X-Auth-Nonce', nonce);
   headers.set('X-Auth-Signature', signature);
 
-  return fetch(pathname, { ...options, method, headers });
+  const response = await fetch(pathname, { ...options, method, headers });
+  await maybeHandleAuthFailure(response);
+  return response;
 }
 
 // ============ Pairing Flow ============
@@ -327,6 +435,7 @@ async function loadFiles() {
   if (btn) { btn.classList.add('spinning'); setTimeout(() => btn.classList.remove('spinning'), 600); }
 
   try {
+    teardownScrollLoader();
     const res = await apiFetch('/api/files');
     if (!res.ok) throw new Error('Failed to load files');
     const { encrypted } = await res.json();
@@ -455,7 +564,9 @@ function toggleDir(dirLi, dirName) {
 }
 
 function setupScrollLoader(listEl) {
-  const observer = new IntersectionObserver((entries) => {
+  teardownScrollLoader();
+
+  scrollLoaderObserver = new IntersectionObserver((entries) => {
     if (entries[0].isIntersecting && !isLoading) {
       const loadMoreEl = listEl.querySelector('.load-more');
       if (loadMoreEl) renderNextPage();
@@ -464,10 +575,10 @@ function setupScrollLoader(listEl) {
   
   const checkLoader = () => {
     const loadMoreEl = listEl.querySelector('.load-more');
-    if (loadMoreEl) observer.observe(loadMoreEl);
+    if (loadMoreEl) scrollLoaderObserver.observe(loadMoreEl);
   };
   checkLoader();
-  setInterval(checkLoader, 500);
+  scrollLoaderTimer = setInterval(checkLoader, 500);
 }
 
 async function downloadFile(name, li) {
@@ -763,15 +874,17 @@ async function init() {
   const storedDeviceId = await KeyStore.get('deviceId');
   if (storedKey && storedDeviceId) {
     try {
-      const statusRes = await fetch('/api/status');
-      const { paired } = await statusRes.json();
-      if (paired) {
-        encryptionKey = hex2buf(storedKey);
-        deviceId = storedDeviceId;
+      encryptionKey = hex2buf(storedKey);
+      deviceId = storedDeviceId;
+      const sessionRes = await apiFetch('/api/session');
+      if (sessionRes.ok) {
         showMainScreen();
         return;
       }
-    } catch { /* server not paired */ }
+    } catch {
+      encryptionKey = null;
+      deviceId = null;
+    }
   }
 
   showPairScreen();

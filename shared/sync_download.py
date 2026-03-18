@@ -15,6 +15,8 @@ import hashlib
 import argparse
 import io
 import tarfile
+import tempfile
+from datetime import datetime, timezone
 
 try:
     import requests
@@ -25,6 +27,7 @@ except ImportError:
 try:
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     from cryptography.hazmat.primitives import hashes, serialization
 except ImportError:
@@ -133,7 +136,7 @@ def api_post(path, body, auth_key=None, device_id=None):
 def api_get_response(path, timeout=60, auth_key=None, device_id=None):
     url = f"{SERVER}{path}"
     headers = build_auth_headers("GET", path, b"", auth_key, device_id) if auth_key else None
-    r = session.get(url, timeout=timeout, headers=headers)
+    r = session.get(url, timeout=timeout, headers=headers, stream=True)
     if r.status_code == 204:
         return r
     if not r.ok:
@@ -223,40 +226,50 @@ def get_key(download_dir, state, state_path):
 # ============ Batch Download ============
 
 def batch_download(key, download_dir, device_id, since=None):
-    """调用 /api/batch 批量下载，返回 (文件数, 总大小)"""
+    """调用 /api/batch 批量下载，返回 (文件数, 总大小, 快照时间戳ms)"""
     url = "/api/batch"
-    if since:
+    if since is not None:
         url += f"?since={since}"
 
     response = api_get_response(url, auth_key=key, device_id=device_id)
-    if response.status_code == 204:
-        return 0, 0
+    try:
+        if response.status_code == 204:
+            return 0, 0, None
 
-    iv_hex = response.headers.get("X-Encrypted-IV")
-    if iv_hex:
-        count = int(response.headers.get("X-Batch-Count", "0"))
-        total_size = int(response.headers.get("X-Batch-Total-Size", "0"))
-        encrypted = response.content
-        if len(encrypted) < 16:
-            raise Exception("批量下载响应过短，无法提取 GCM tag")
-        archive = aes_decrypt_bytes(key, iv_hex, encrypted[:-16], encrypted[-16:])
-    else:
+        snapshot_at = parse_sync_cursor(response.headers.get("X-Batch-Snapshot-At"))
+        iv_hex = response.headers.get("X-Encrypted-IV")
+        if iv_hex:
+            count = int(response.headers.get("X-Batch-Count", "0"))
+            total_size = int(response.headers.get("X-Batch-Total-Size", "0"))
+
+            with tempfile.TemporaryDirectory(prefix="cloudsysncd-batch-") as temp_dir:
+                encrypted_path = os.path.join(temp_dir, "batch.enc")
+                archive_path = os.path.join(temp_dir, "batch.tar.gz")
+                write_response_to_file(response, encrypted_path)
+                decrypt_gcm_file(key, iv_hex, encrypted_path, archive_path)
+
+                with tarfile.open(archive_path, mode="r:gz") as tf:
+                    safe_extract_tar(tf, download_dir)
+
+            return count, total_size, snapshot_at
+
         data = response.json()
         count = data.get("count", 0)
         total_size = data.get("totalSize", 0)
 
         if count == 0 or data.get("encrypted") is None:
-            return 0, 0
+            return 0, 0, snapshot_at
 
         enc = data["encrypted"]
         archive = aes_decrypt(key, enc["iv"], enc["ciphertext"], enc["tag"])
 
-    # 解压 tar.gz 到目标目录
-    buf = io.BytesIO(archive)
-    with tarfile.open(fileobj=buf, mode="r:gz") as tf:
-        safe_extract_tar(tf, download_dir)
+        buf = io.BytesIO(archive)
+        with tarfile.open(fileobj=buf, mode="r:gz") as tf:
+            safe_extract_tar(tf, download_dir)
 
-    return count, total_size
+        return count, total_size, snapshot_at
+    finally:
+        response.close()
 
 
 def format_size(n):
@@ -276,13 +289,58 @@ def safe_extract_tar(tf, download_dir):
     tf.extractall(path=download_dir)
 
 
+def write_response_to_file(response, target_path):
+    with open(target_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+
+
+def decrypt_gcm_file(key_bytes, iv_hex, encrypted_path, output_path):
+    encrypted_size = os.path.getsize(encrypted_path)
+    if encrypted_size < 16:
+        raise Exception("批量下载响应过短，无法提取 GCM tag")
+
+    iv = hex_to_bytes(iv_hex)
+    ciphertext_size = encrypted_size - 16
+    with open(encrypted_path, "rb") as src:
+        src.seek(ciphertext_size)
+        tag = src.read(16)
+        src.seek(0)
+
+        decryptor = Cipher(
+            algorithms.AES(key_bytes),
+            modes.GCM(iv, tag),
+        ).decryptor()
+
+        remaining = ciphertext_size
+        with open(output_path, "wb") as out:
+            while remaining > 0:
+                chunk = src.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise Exception("批量下载密文读取中断")
+                remaining -= len(chunk)
+                out.write(decryptor.update(chunk))
+
+            out.write(decryptor.finalize())
+
+
 # ============ Main ============
 
 def load_state(p):
+    state = {"last_sync": None, "last_sync_ms": None, "device_id": None}
     if os.path.exists(p):
         with open(p, "r") as f:
-            return json.load(f)
-    return {"last_sync": None, "device_id": None}
+            loaded = json.load(f)
+            if isinstance(loaded, dict):
+                state.update(loaded)
+
+    cursor = parse_sync_cursor(state.get("last_sync_ms"))
+    if cursor is None:
+        cursor = parse_sync_cursor(state.get("last_sync"))
+    state["last_sync_ms"] = cursor
+    state["last_sync"] = format_sync_cursor(cursor) if cursor is not None else None
+    return state
 
 
 def save_state(p, s):
@@ -291,18 +349,45 @@ def save_state(p, s):
 
 
 def poll_once(key, device_id, download_dir, state, state_path):
-    since = state.get("last_sync")
+    since = state.get("last_sync_ms")
     try:
-        count, total_size = batch_download(key, download_dir, device_id, since=since)
+        count, total_size, snapshot_at = batch_download(key, download_dir, device_id, since=since)
     except Exception as e:
         print(f"  [!] 批量下载失败: {e}")
         return 0
 
     if count > 0:
-        state["last_sync"] = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        cursor = snapshot_at if snapshot_at is not None else int(time.time() * 1000)
+        state["last_sync_ms"] = cursor
+        state["last_sync"] = format_sync_cursor(cursor)
         save_state(state_path, state)
         print(f"  + {count} 个文件 ({format_size(total_size)})")
     return count
+
+
+def parse_sync_cursor(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+
+    try:
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def format_sync_cursor(timestamp_ms):
+    if timestamp_ms is None:
+        return None
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def main():

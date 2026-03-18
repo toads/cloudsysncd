@@ -18,9 +18,28 @@ fetch(`http://127.0.0.1:${PORT}/api/local/new-pin`, {
   method: 'POST',
   headers: { 'x-admin-token': token },
 })
-  .then(r => r.json())
+  .then(async (r) => {
+    const text = await r.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = {};
+    }
+
+    if (!r.ok) {
+      throw new Error(data.error || `HTTP ${r.status}`);
+    }
+    return data;
+  })
   .then(data => {
     if (data.pin) console.log(`\nNew pairing PIN: ${data.pin}\n`);
-    else console.error('Error:', data.error);
+    else {
+      console.error('Error:', data.error || 'Unknown error');
+      process.exit(1);
+    }
   })
-  .catch(() => console.error('Server not running?'));
+  .catch((err) => {
+    console.error(err.message || 'Server not running?');
+    process.exit(1);
+  });
