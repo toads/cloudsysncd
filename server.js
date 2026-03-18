@@ -29,6 +29,10 @@ const seenRequestNonces = new Map();
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const sharedDir = path.resolve(process.env.SHARED_DIR || path.join(__dirname, 'shared'));
+const repoSharedSourceDir = path.resolve(path.join(__dirname, 'shared'));
+const INTERNAL_SHARED_RELATIVE_PATHS = new Set(
+  sharedDir === repoSharedSourceDir ? ['sync_download.py'] : []
+);
 
 // ============ Persistent State ============
 
@@ -96,6 +100,13 @@ function serializeDevice(device) {
     revokedAt: device.revokedAt,
     active: !device.revokedAt,
   };
+}
+
+function isInternalSharedRelPath(relPath) {
+  const normalized = String(relPath || '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '');
+  return INTERNAL_SHARED_RELATIVE_PATHS.has(normalized);
 }
 
 // Master key: generated once, persisted forever
@@ -587,6 +598,7 @@ function walkDir(dir, prefix = '') {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     if (entry.name.startsWith('.')) continue;
     const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (isInternalSharedRelPath(relPath)) continue;
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       results.push({ name: relPath, type: 'dir' });
@@ -604,6 +616,7 @@ function resolveSharedEntry(relPath) {
     .replace(/\\/g, '/')
     .replace(/^\/+/, '')
     .replace(/\/{2,}/g, '/');
+  if (isInternalSharedRelPath(normalized)) return null;
   const fullPath = path.resolve(path.join(sharedDir, normalized));
   if (!fullPath.startsWith(path.resolve(sharedDir))) return null;
   return { relPath: normalized, fullPath };

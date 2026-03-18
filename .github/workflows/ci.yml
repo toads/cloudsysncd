@@ -45,7 +45,7 @@ jobs:
         run: node --check scripts/integration-test.js
 
       - name: Compile Python client
-        run: python3 -m py_compile shared/sync_download.py
+        run: python3 -m py_compile shared/sync_download.py syncd_client/cli.py
 
       - name: Audit npm dependencies
         run: npm audit --registry=https://registry.npmjs.org

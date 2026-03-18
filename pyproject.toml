@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-cloudsysncd-sync = "shared.sync_download:main"
+cloudsysncd-sync = "syncd_client.cli:run"
 
 [tool.setuptools]
-packages = ["shared"]
+packages = ["syncd_client"]

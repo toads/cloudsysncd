@@ -14,5 +14,4 @@ dist/
 
 # Runtime shared payloads and local audit artifacts.
 shared/*
-!shared/__init__.py
 !shared/sync_download.py

@@ -21,7 +21,8 @@
 - `public/`: 前端页面
 - `pin.js`: 本机生成新 PIN
 - `share.js`: 把文件复制到 `shared/`
-- `shared/sync_download.py`: Python 自动下载客户端
+- `shared/sync_download.py`: Python 自动下载客户端兼容入口
+- `syncd_client/`: Python 客户端实现与打包入口
 - `data/`: 运行时状态，保存主密钥、已配对设备和本地管理 token，不应提交
 
 ## 环境要求
