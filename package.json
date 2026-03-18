@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "./start.sh",
-    "dev": "nodemon --watch server.js --watch public server.js",
+    "dev": "./start.sh --dev",
     "smoke": "node scripts/smoke-test.js",
     "test": "npm run smoke"
   },

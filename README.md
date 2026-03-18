@@ -53,7 +53,17 @@ npm start
 
 - `./start.sh` 是统一启动入口
 - `npm start` 本质上也是调用 `./start.sh`
+- `npm run dev` 本质上是调用 `./start.sh --dev`
 - Docker 镜像内部同样使用 `./start.sh`
+
+常见启动方式：
+
+```bash
+./start.sh --help
+./start.sh --dev
+./start.sh --port 22991 --data-dir ./.local/data --shared-dir ./.local/shared
+./start.sh --cloudflare
+```
 
 如果你想先验证本地启动链路是否正常，可以运行：
 
