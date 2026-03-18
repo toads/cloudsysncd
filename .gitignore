@@ -3,10 +3,16 @@ data/
 .local/
 .DS_Store
 .claude/
+.playwright-cli/
 __pycache__/
+*.pyc
 .syncd_state.json
 .syncd_key
+build/
+dist/
+*.egg-info/
 
 # Runtime shared payloads and local audit artifacts.
 shared/*
+!shared/__init__.py
 !shared/sync_download.py

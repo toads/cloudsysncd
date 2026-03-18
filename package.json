@@ -7,7 +7,8 @@
     "start": "./start.sh",
     "dev": "./start.sh --dev",
     "smoke": "node scripts/smoke-test.js",
-    "test": "npm run smoke"
+    "integration": "node scripts/integration-test.js",
+    "test": "npm run smoke && npm run integration"
   },
   "keywords": [],
   "author": "",

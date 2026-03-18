@@ -41,11 +41,14 @@ jobs:
       - name: Check smoke test syntax
         run: node --check scripts/smoke-test.js
 
+      - name: Check integration test syntax
+        run: node --check scripts/integration-test.js
+
       - name: Compile Python client
         run: python3 -m py_compile shared/sync_download.py
 
       - name: Audit npm dependencies
         run: npm audit --registry=https://registry.npmjs.org
 
-      - name: Run smoke test
-        run: npm run smoke
+      - name: Run test suite
+        run: npm test

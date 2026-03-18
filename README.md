@@ -8,11 +8,12 @@
 
 ## 功能
 
-- 浏览器端 PIN 配对
+- 浏览器端 PIN 配对、倒计时提示与设备命名
 - `shared/` 目录文件共享
-- 单文件下载和批量下载
-- 文本共享 API
-- Python 自动轮询下载脚本
+- 单文件下载、目录打包下载与真批量归档下载
+- 文本共享 Web 面板与 API
+- 设备列表查看与单设备撤销
+- 可安装的 Python 自动轮询下载 CLI
 
 ## 目录说明
 
@@ -46,8 +47,9 @@ npm start
 
 1. 打开浏览器访问 `http://127.0.0.1:21891`
 2. 首次启动时服务端会在终端打印 6 位 PIN
-3. 在网页输入 PIN 完成配对
+3. 在网页输入 PIN，并为当前设备填写一个可识别名称
 4. 把要共享的文件放入 `shared/`，或者使用 `node share.js ...`
+5. 在网页中搜索、选择、下载文件，或发送共享文本
 
 说明：
 
@@ -123,9 +125,27 @@ node share.js --clear
 node pin.js
 ```
 
+查看已配对设备：
+
+```bash
+node pin.js --devices
+```
+
+撤销某个设备：
+
+```bash
+node pin.js --revoke <device-id>
+```
+
 ## Python 自动下载客户端
 
 安装依赖：
+
+```bash
+pip install .
+```
+
+或者保持原来的脚本式使用：
 
 ```bash
 pip install requests cryptography
@@ -134,19 +154,33 @@ pip install requests cryptography
 运行一次：
 
 ```bash
-SYNCD_SERVER=http://127.0.0.1:21891 python3 shared/sync_download.py --once --dir ./downloads
+SYNCD_SERVER=http://127.0.0.1:21891 cloudsysncd-sync --once --dir ./downloads
 ```
 
 持续轮询：
 
 ```bash
+SYNCD_SERVER=http://127.0.0.1:21891 cloudsysncd-sync --interval 60 --dir ./downloads
+```
+
+保留原脚本调用方式也可以：
+
+```bash
 SYNCD_SERVER=http://127.0.0.1:21891 python3 shared/sync_download.py --interval 60 --dir ./downloads
+```
+
+常用增强参数：
+
+```bash
+cloudsysncd-sync --device-name "NAS Puller" --state-dir ./sync-state --verify-tls
 ```
 
 说明：
 
 - 首次运行会提示输入 6 位 PIN
-- 客户端会在下载目录写入 `.syncd_key` 和 `.syncd_state.json`
+- 默认会在下载目录写入 `.syncd_key` 和 `.syncd_state.json`
+- 也可以通过 `--state-dir` 把状态文件与下载目录分离
+- 默认会对 `https://` 地址启用 TLS 校验；如需跳过校验可显式传 `--insecure`
 - 如果下载目录里已有旧版 `.syncd_key` 但没有 `device_id`，升级后首次运行需要重新配对一次
 - 这两个文件包含敏感状态，默认已加入 `.gitignore`
 
@@ -155,7 +189,9 @@ SYNCD_SERVER=http://127.0.0.1:21891 python3 shared/sync_download.py --interval 6
 - `PORT`: 服务端监听端口，默认 `21891`
 - `DATA_DIR`: 服务端运行时状态目录，默认 `./data`
 - `SHARED_DIR`: 服务端共享文件目录，默认 `./shared`
+- `PAIR_SESSION_TTL_MS`: 配对 PIN 有效期，默认 `600000`
 - `SYNCD_SERVER`: Python 客户端访问的服务端地址
+- `SYNCD_VERIFY_TLS`: Python 客户端是否校验证书，可选值 `true/false`
 
 如果你要使用自定义 Cloudflare 域名或 `trycloudflare`，还需要先在本机安装 `cloudflared`。
 
@@ -172,6 +208,11 @@ GET /healthz
 - Docker healthcheck
 - CI smoke test
 - 本地部署排障
+
+当前返回体还会补充：
+
+- `pairedDeviceCount`
+- `pendingPairExpiresAt`
 
 ## 部署方案
 
@@ -224,10 +265,10 @@ git ls-files
 
 ## 已知限制
 
-- 当前服务端已增加逐请求 HMAC 验签，但还没有完整的设备撤销界面和密钥轮换流程
+- 当前服务端已增加逐请求 HMAC 验签和设备撤销，但还没有密钥轮换流程
 - 浏览器端会把主密钥保存在 IndexedDB
 - Python 客户端会把主密钥保存在下载目录
 - 客户端解密阶段仍需要在本地持有完整响应内容
-- 文本共享目前只暴露服务端 API，还没有对应的 Web 页面入口
+- 浏览器端的大归档下载仍会先完整接收密文再在本地解密，更适合中小规模使用
 
 这些问题的详细说明见 [OPEN_SOURCE_AUDIT.md](./OPEN_SOURCE_AUDIT.md)。
