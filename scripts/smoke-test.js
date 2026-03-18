@@ -70,7 +70,7 @@ async function main() {
 
   const port = await getFreePort();
   const logs = [];
-  const child = spawn(process.execPath, ['server.js'], {
+  const child = spawn(path.resolve(__dirname, '..', 'start.sh'), [], {
     cwd: path.resolve(__dirname, '..'),
     env: {
       ...process.env,

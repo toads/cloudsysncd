@@ -4,7 +4,7 @@
   "description": "Encrypted file sync and share service with PIN pairing and Cloudflare Tunnel support.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "./start.sh",
     "dev": "nodemon --watch server.js --watch public server.js",
     "smoke": "node scripts/smoke-test.js",
     "test": "npm run smoke"

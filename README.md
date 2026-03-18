@@ -33,6 +33,12 @@
 
 ```bash
 npm install
+./start.sh
+```
+
+或者：
+
+```bash
 npm start
 ```
 
@@ -42,6 +48,12 @@ npm start
 2. 首次启动时服务端会在终端打印 6 位 PIN
 3. 在网页输入 PIN 完成配对
 4. 把要共享的文件放入 `shared/`，或者使用 `node share.js ...`
+
+说明：
+
+- `./start.sh` 是统一启动入口
+- `npm start` 本质上也是调用 `./start.sh`
+- Docker 镜像内部同样使用 `./start.sh`
 
 如果你想先验证本地启动链路是否正常，可以运行：
 
@@ -65,6 +77,7 @@ docker compose up --build -d
 - 运行时数据写入 `./.local/data`
 - 共享文件目录映射到 `./.local/shared`
 - 宿主机侧 `node pin.js` 和 `node share.js` 会优先识别这套 Docker Compose 运行时目录
+- 容器内部启动入口仍然是同一个 `./start.sh`
 
 启动后可以通过下面的命令看健康状态：
 
