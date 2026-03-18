@@ -169,6 +169,8 @@ const elements = {
   refreshFilesBtn: document.getElementById('refresh-files-btn'),
   toggleSelectionModeBtn: document.getElementById('toggle-selection-mode-btn'),
   fileSearchInput: document.getElementById('file-search-input'),
+  fileTypeFilter: document.getElementById('file-type-filter'),
+  fileDateFilter: document.getElementById('file-date-filter'),
   fileSortSelect: document.getElementById('file-sort-select'),
   fileList: document.getElementById('file-list'),
   fileSummary: document.getElementById('file-summary'),
@@ -256,7 +258,6 @@ let allEntries = [];
 let visibleEntries = [];
 let currentPage = 0;
 let isRenderingPage = false;
-let flatFileMode = false;
 
 let selectionMode = false;
 let selectedFiles = new Set();
@@ -696,35 +697,196 @@ function setupPinInputs() {
 
 // ============ Files ============
 
-function updateFileSummary() {
-  const fileEntries = allEntries.filter((entry) => entry.type === 'file');
-  const totalSize = fileEntries.reduce((sum, entry) => sum + (entry.size || 0), 0);
-  elements.fileSummary.textContent = `${fileEntries.length} 个文件 · ${formatSize(totalSize)}`;
-  elements.fileRefreshLabel.textContent = `上次刷新 ${new Date().toLocaleTimeString()}`;
+const FILE_TYPE_GROUPS = {
+  image: new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'heic', 'avif']),
+  video: new Set(['mp4', 'mov', 'm4v', 'mkv', 'avi', 'wmv', 'webm']),
+  audio: new Set(['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a']),
+  archive: new Set(['zip', 'rar', '7z', 'tar', 'gz', 'tgz', 'bz2', 'xz']),
+  document: new Set(['pdf', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'txt', 'rtf', 'csv', 'md']),
+  code: new Set(['js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'py', 'go', 'rs', 'java', 'c', 'cc', 'cpp', 'h', 'hpp', 'sh', 'zsh', 'bash', 'json', 'yaml', 'yml', 'toml', 'css', 'html', 'sql']),
+};
+
+const ENTRY_TYPE_LABELS = {
+  dir: '文件夹',
+  image: '图片',
+  video: '视频',
+  audio: '音频',
+  archive: '压缩包',
+  document: '文档',
+  code: '代码',
+  other: '其他',
+};
+
+const ENTRY_TYPE_SHORT_LABELS = {
+  dir: 'DIR',
+  image: 'IMG',
+  video: 'VID',
+  audio: 'AUD',
+  archive: 'ZIP',
+  document: 'DOC',
+  code: 'DEV',
+  other: 'FILE',
+};
+
+function compareText(left, right) {
+  return left.localeCompare(right, 'zh-Hans-CN', { numeric: true, sensitivity: 'base' });
+}
+
+function getEntryBaseName(entry) {
+  return String(entry?.name || '').split('/').pop() || '';
+}
+
+function getEntryParentPath(entry) {
+  const parts = String(entry?.name || '').split('/');
+  parts.pop();
+  return parts.join('/');
+}
+
+function getEntryExtension(entry) {
+  if (entry?.type !== 'file') return '';
+  const baseName = getEntryBaseName(entry);
+  const lastDot = baseName.lastIndexOf('.');
+  return lastDot > 0 ? baseName.slice(lastDot + 1).toLowerCase() : '';
+}
+
+function getEntryTypeKey(entry) {
+  if (entry?.type === 'dir') return 'dir';
+  const extension = getEntryExtension(entry);
+  for (const [type, extensions] of Object.entries(FILE_TYPE_GROUPS)) {
+    if (extensions.has(extension)) return type;
+  }
+  return 'other';
+}
+
+function getEntryTypeLabel(entry) {
+  return ENTRY_TYPE_LABELS[getEntryTypeKey(entry)] || '其他';
+}
+
+function getEntryTypeShortLabel(entry) {
+  return ENTRY_TYPE_SHORT_LABELS[getEntryTypeKey(entry)] || 'FILE';
+}
+
+function formatEntryModified(entry) {
+  const timestamp = Date.parse(entry?.modified || '');
+  return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString() : '—';
+}
+
+function getSortableTimestamp(entry) {
+  const timestamp = Date.parse(entry?.modified || '');
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function getSortableSize(entry) {
+  if (entry?.type !== 'file') return null;
+  return Number.isFinite(entry?.size) ? entry.size : 0;
+}
+
+function matchesDateFilter(entry, filterValue) {
+  if (filterValue === 'all') return true;
+  const modifiedAt = getSortableTimestamp(entry);
+  if (modifiedAt === null) return false;
+
+  const now = Date.now();
+  const ranges = {
+    '24h': 24 * 60 * 60 * 1000,
+    '7d': 7 * 24 * 60 * 60 * 1000,
+    '30d': 30 * 24 * 60 * 60 * 1000,
+    '90d': 90 * 24 * 60 * 60 * 1000,
+  };
+  return now - modifiedAt <= (ranges[filterValue] || 0);
+}
+
+function compareByName(left, right, direction = 'asc') {
+  const typeBias = left.type === right.type ? 0 : (left.type === 'dir' ? -1 : 1);
+  if (typeBias !== 0) return direction === 'desc' ? -typeBias : typeBias;
+
+  const byBaseName = compareText(getEntryBaseName(left), getEntryBaseName(right));
+  if (byBaseName !== 0) return direction === 'desc' ? -byBaseName : byBaseName;
+
+  const byPath = compareText(left.name, right.name);
+  return direction === 'desc' ? -byPath : byPath;
+}
+
+function compareEntries(left, right, sortValue) {
+  if (sortValue === 'name-asc') return compareByName(left, right, 'asc');
+  if (sortValue === 'name-desc') return compareByName(left, right, 'desc');
+
+  if (sortValue === 'type-asc') {
+    const byType = compareText(getEntryTypeLabel(left), getEntryTypeLabel(right));
+    if (byType !== 0) return byType;
+    return compareByName(left, right, 'asc');
+  }
+
+  if (sortValue === 'modified-asc' || sortValue === 'modified-desc') {
+    const leftTimestamp = getSortableTimestamp(left);
+    const rightTimestamp = getSortableTimestamp(right);
+    if (leftTimestamp === null && rightTimestamp === null) return compareByName(left, right, 'asc');
+    if (leftTimestamp === null) return 1;
+    if (rightTimestamp === null) return -1;
+    const byTimestamp = sortValue === 'modified-asc'
+      ? leftTimestamp - rightTimestamp
+      : rightTimestamp - leftTimestamp;
+    if (byTimestamp !== 0) return byTimestamp;
+    return compareByName(left, right, 'asc');
+  }
+
+  if (sortValue === 'size-asc' || sortValue === 'size-desc') {
+    const leftSize = getSortableSize(left);
+    const rightSize = getSortableSize(right);
+    if (leftSize === null && rightSize === null) return compareByName(left, right, 'asc');
+    if (leftSize === null) return 1;
+    if (rightSize === null) return -1;
+    const bySize = sortValue === 'size-asc' ? leftSize - rightSize : rightSize - leftSize;
+    if (bySize !== 0) return bySize;
+    return compareByName(left, right, 'asc');
+  }
+
+  return compareByName(left, right, 'asc');
 }
 
 function updateVisibleEntries() {
   const searchTerm = elements.fileSearchInput.value.trim().toLowerCase();
+  const typeFilter = elements.fileTypeFilter.value;
+  const dateFilter = elements.fileDateFilter.value;
   const sortValue = elements.fileSortSelect.value;
-  flatFileMode = Boolean(searchTerm) || sortValue !== 'tree';
-
-  if (!flatFileMode) {
-    visibleEntries = allEntries.slice();
-    return;
-  }
 
   visibleEntries = allEntries
-    .filter((entry) => entry.type === 'file')
-    .filter((entry) => entry.name.toLowerCase().includes(searchTerm))
-    .sort((left, right) => {
-      if (sortValue === 'modified-desc') {
-        return Date.parse(right.modified || 0) - Date.parse(left.modified || 0);
-      }
-      if (sortValue === 'size-desc') {
-        return (right.size || 0) - (left.size || 0);
-      }
-      return left.name.localeCompare(right.name, 'zh-Hans-CN');
-    });
+    .filter((entry) => {
+      if (!searchTerm) return true;
+      const haystack = [
+        entry.name,
+        getEntryBaseName(entry),
+        getEntryParentPath(entry),
+        getEntryTypeLabel(entry),
+      ].join(' ').toLowerCase();
+      return haystack.includes(searchTerm);
+    })
+    .filter((entry) => {
+      if (typeFilter === 'all') return true;
+      if (typeFilter === 'file') return entry.type === 'file';
+      if (typeFilter === 'dir') return entry.type === 'dir';
+      return getEntryTypeKey(entry) === typeFilter;
+    })
+    .filter((entry) => matchesDateFilter(entry, dateFilter))
+    .sort((left, right) => compareEntries(left, right, sortValue));
+}
+
+function updateFileSummary() {
+  const totalFiles = allEntries.filter((entry) => entry.type === 'file');
+  const totalDirs = allEntries.filter((entry) => entry.type === 'dir').length;
+  const totalSize = totalFiles.reduce((sum, entry) => sum + (entry.size || 0), 0);
+  const visibleFiles = visibleEntries.filter((entry) => entry.type === 'file').length;
+  const visibleDirs = visibleEntries.filter((entry) => entry.type === 'dir').length;
+
+  let summary = `${totalFiles.length} 个文件`;
+  if (totalDirs > 0) summary += ` · ${totalDirs} 个文件夹`;
+  summary += ` · ${formatSize(totalSize)}`;
+  if (visibleEntries.length !== allEntries.length) {
+    summary += ` · 当前显示 ${visibleFiles + visibleDirs} 项`;
+  }
+
+  elements.fileSummary.textContent = summary;
+  elements.fileRefreshLabel.textContent = `上次刷新 ${new Date().toLocaleTimeString()}`;
 }
 
 function renderSelectionState() {
@@ -748,61 +910,60 @@ function syncRenderedSelection() {
 
 function createFileItemMarkup(entry) {
   const isDir = entry.type === 'dir';
-  const depth = flatFileMode ? 0 : Math.min((entry.name.match(/\//g) || []).length, 3);
-  const baseName = entry.name.split('/').pop();
+  const baseName = getEntryBaseName(entry);
+  const parentPath = getEntryParentPath(entry);
   const escapedName = escapeHtml(baseName);
   const escapedFullPath = escapeHtml(entry.name);
   const checkboxId = `file-${btoa(entry.name).replace(/=+$/, '')}`;
+  const typeKey = getEntryTypeKey(entry);
+  const typeLabel = escapeHtml(getEntryTypeLabel(entry));
+  const modifiedLabel = escapeHtml(formatEntryModified(entry));
+  const sizeLabel = isDir ? '—' : escapeHtml(formatSize(entry.size || 0));
+  const locationLabel = escapeHtml(parentPath || 'shared/');
+  const actionMarkup = isDir
+    ? `<button class="dir-action file-action-btn" type="button" data-dir-download="${escapedFullPath}" data-row-action-label>打包</button>`
+    : `<button class="dir-action file-action-btn" type="button" data-file-download="${escapedFullPath}" data-row-action-label>下载</button>`;
 
-  if (isDir) {
-    return `<li class="file-item dir-item indent-${depth}" data-dir="${escapedFullPath}">
-      <div class="dir-name dir-toggle">
-        <svg class="dir-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
-        <span>${escapedName}</span>
-      </div>
-      <button class="dir-action" data-dir-download="${escapedFullPath}">打包</button>
-    </li>`;
-  }
-
-  const metaParts = [];
-  if (flatFileMode && entry.name !== baseName) {
-    metaParts.push(`<div class="file-path">${escapedFullPath}</div>`);
-  }
-  metaParts.push(`${formatSize(entry.size)} · ${new Date(entry.modified).toLocaleString()}`);
-
-  return `<li class="file-item indent-${depth}" data-name="${escapedFullPath}">
-    <input type="checkbox" class="file-checkbox" id="${checkboxId}">
-    <label for="${checkboxId}" class="file-checkbox-label">
+  return `<li class="file-item${isDir ? ' dir-item' : ''}"${isDir ? ` data-dir="${escapedFullPath}"` : ` data-name="${escapedFullPath}"`}>
+    ${isDir ? '' : `<input type="checkbox" class="file-checkbox" id="${checkboxId}">`}
+    ${isDir ? '' : `<label for="${checkboxId}" class="file-checkbox-label">
       <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>
-    </label>
-    <div class="file-content-wrapper">
-      <div class="file-name">${escapedName}</div>
-      <div class="file-meta">${metaParts.join('')}</div>
+    </label>`}
+    <div class="file-col-name">
+      <div class="file-icon kind-${escapeHtml(typeKey)}">${escapeHtml(getEntryTypeShortLabel(entry))}</div>
+      <div class="file-content-wrapper">
+        <div class="file-name">${escapedName}</div>
+        <div class="file-meta">
+          <span class="file-path">${locationLabel}</span>
+        </div>
+      </div>
     </div>
-    <span class="file-dl">下载</span>
+    <div class="file-col file-col-type">${typeLabel}</div>
+    <div class="file-col file-col-modified">${modifiedLabel}</div>
+    <div class="file-col file-col-size">${sizeLabel}</div>
+    <div class="file-col file-col-action">${actionMarkup}</div>
   </li>`;
 }
 
 function renderEmptyFiles() {
-  const searchTerm = elements.fileSearchInput.value.trim();
+  const hasFilters = Boolean(elements.fileSearchInput.value.trim())
+    || elements.fileTypeFilter.value !== 'all'
+    || elements.fileDateFilter.value !== 'all';
+
   if (allEntries.length === 0) {
     elements.fileList.innerHTML = '<li class="empty-state"><div class="empty-icon">📁</div>暂无共享文件<br><span style="font-size:0.72rem;color:var(--text-3)">将文件放入 shared/ 目录即可</span></li>';
     return;
   }
 
-  if (flatFileMode) {
-    const message = searchTerm ? '没有匹配当前搜索条件的文件' : '当前筛选结果为空';
-    elements.fileList.innerHTML = `<li class="empty-state"><div class="empty-icon">🔎</div>${escapeHtml(message)}<br><span style="font-size:0.72rem;color:var(--text-3)">清空搜索或切回树状视图试试</span></li>`;
-    return;
-  }
-
-  elements.fileList.innerHTML = '<li class="empty-state"><div class="empty-icon">📁</div>暂无可显示项目</li>';
+  const message = hasFilters ? '没有匹配当前筛选条件的项目' : '当前没有可显示的项目';
+  const hint = hasFilters ? '调整类型、时间或搜索条件后再试试' : '刷新一下，或者检查 shared/ 目录';
+  elements.fileList.innerHTML = `<li class="empty-state"><div class="empty-icon">🔎</div>${escapeHtml(message)}<br><span style="font-size:0.72rem;color:var(--text-3)">${escapeHtml(hint)}</span></li>`;
 }
 
 function renderFileList() {
   teardownScrollLoader();
   updateVisibleEntries();
+  updateFileSummary();
   currentPage = 0;
   elements.fileList.innerHTML = '';
   if (visibleEntries.length === 0) {
@@ -877,33 +1038,22 @@ async function loadFiles() {
     const { encrypted } = await response.json();
     const plain = await Crypto.decrypt(encryptionKey, encrypted.iv, encrypted.ciphertext, encrypted.tag);
     allEntries = JSON.parse(new TextDecoder().decode(plain));
-    updateFileSummary();
     renderFileList();
   } catch (error) {
     elements.fileList.innerHTML = `<li class="loading" style="color:var(--error)">${escapeHtml(error.message)}</li>`;
   }
 }
 
-function toggleDir(item) {
-  if (flatFileMode) return;
-  const dirName = item.dataset.dir || '';
-  const collapsed = item.classList.toggle('collapsed');
-  let sibling = item.nextElementSibling;
-  const prefix = `${dirName}/`;
-  while (sibling) {
-    const name = sibling.dataset.name || sibling.dataset.dir || '';
-    if (!name.startsWith(prefix)) break;
-    sibling.classList.toggle('dir-child-hidden', collapsed);
-    sibling = sibling.nextElementSibling;
-  }
+function setRowActionLabel(element, label) {
+  const actionLabel = element?.querySelector('[data-row-action-label]');
+  if (actionLabel) actionLabel.textContent = label;
 }
 
 async function downloadFile(name, element) {
   if (element?.classList.contains('downloading')) return;
   if (element) {
     element.classList.add('downloading');
-    const label = element.querySelector('.file-dl');
-    if (label) label.textContent = '解密中...';
+    setRowActionLabel(element, '解密中');
   }
 
   try {
@@ -918,8 +1068,7 @@ async function downloadFile(name, element) {
   } finally {
     if (element) {
       element.classList.remove('downloading');
-      const label = element.querySelector('.file-dl');
-      if (label) label.textContent = '下载';
+      setRowActionLabel(element, '下载');
     }
   }
 }
@@ -946,14 +1095,20 @@ async function downloadArchive(paths, fallbackName) {
 
 async function downloadDirectory(dirName, element) {
   if (element?.classList.contains('downloading')) return;
-  if (element) element.classList.add('downloading');
+  if (element) {
+    element.classList.add('downloading');
+    setRowActionLabel(element, '打包中');
+  }
   try {
     await downloadArchive([dirName], `${dirName.split('/').pop() || 'folder'}.tar.gz`);
     toast(`${dirName.split('/').pop()} 已打包下载`, 'ok');
   } catch (error) {
     toast(`目录下载失败: ${error.message}`, 'err');
   } finally {
-    if (element) element.classList.remove('downloading');
+    if (element) {
+      element.classList.remove('downloading');
+      setRowActionLabel(element, '打包');
+    }
   }
 }
 
@@ -1141,6 +1296,8 @@ function setupEventListeners() {
   elements.sendTextBtn.addEventListener('click', sendText);
 
   elements.fileSearchInput.addEventListener('input', () => renderFileList());
+  elements.fileTypeFilter.addEventListener('change', () => renderFileList());
+  elements.fileDateFilter.addEventListener('change', () => renderFileList());
   elements.fileSortSelect.addEventListener('change', () => renderFileList());
 
   elements.pairDeviceName.addEventListener('change', () => {
@@ -1150,18 +1307,19 @@ function setupEventListeners() {
   });
 
   elements.fileList.addEventListener('click', (event) => {
+    const fileButton = event.target.closest('[data-file-download]');
+    if (fileButton) {
+      event.stopPropagation();
+      const row = fileButton.closest('.file-item');
+      downloadFile(fileButton.getAttribute('data-file-download'), row);
+      return;
+    }
+
     const dirButton = event.target.closest('[data-dir-download]');
     if (dirButton) {
       event.stopPropagation();
       const row = dirButton.closest('.file-item');
       downloadDirectory(dirButton.getAttribute('data-dir-download'), row);
-      return;
-    }
-
-    const dirToggle = event.target.closest('.dir-toggle');
-    if (dirToggle) {
-      event.stopPropagation();
-      toggleDir(dirToggle.closest('.file-item'));
       return;
     }
 

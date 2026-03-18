@@ -330,7 +330,7 @@
 
     .toolbar {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 180px;
+      grid-template-columns: minmax(0, 2.2fr) 150px 150px 180px;
       gap: 0.8rem;
     }
     .toolbar-input, .toolbar-select {
@@ -387,84 +387,182 @@
     .refresh-btn.spinning svg { animation: spin 0.6s linear; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    .file-browser {
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) - 2px);
+      background: rgba(255,255,255,0.02);
+      overflow: hidden;
+    }
+    .file-browser-scroll, .text-list {
+      max-height: 52vh;
+      overflow: auto;
+      overscroll-behavior: contain;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255,255,255,0.08) transparent;
+    }
+    .file-browser-scroll::-webkit-scrollbar, .text-list::-webkit-scrollbar { width: 8px; height: 8px; }
+    .file-browser-scroll::-webkit-scrollbar-thumb, .text-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 999px; }
+
+    .file-table-header, .file-item {
+      min-width: 860px;
+      display: grid;
+      grid-template-columns: minmax(320px, 3.2fr) 132px 180px 110px 96px;
+      gap: 0.85rem;
+      align-items: center;
+    }
+    .file-table-header {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      padding: 0.78rem 1rem;
+      background: rgba(10,13,18,0.96);
+      border-bottom: 1px solid var(--border);
+      color: var(--text-3);
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .file-header-size, .file-header-action { text-align: right; }
+
     .file-list, .text-list {
       list-style: none;
       display: flex;
       flex-direction: column;
-      gap: 0.45rem;
-      max-height: 52vh;
-      overflow-y: auto;
-      overscroll-behavior: contain;
-      padding-right: 4px;
-      scrollbar-width: thin;
-      scrollbar-color: rgba(255,255,255,0.08) transparent;
     }
-    .file-list::-webkit-scrollbar, .text-list::-webkit-scrollbar { width: 5px; }
-    .file-list::-webkit-scrollbar-thumb, .text-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 4px; }
 
     .file-item {
-      display: flex;
-      align-items: center;
-      gap: 12px;
       padding: 0.78rem 1rem;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
+      background: transparent;
+      border-bottom: 1px solid var(--border);
       cursor: pointer;
       transition: all 0.15s ease;
       position: relative;
     }
-    .file-item:hover { background: var(--surface-hover); border-color: rgba(255,255,255,0.1); }
+    .file-item:last-child { border-bottom: none; }
+    .file-item:hover { background: var(--surface-hover); }
     .file-item.downloading { opacity: 0.55; pointer-events: none; }
     .file-item.dir-item {
       cursor: default;
-      background: transparent;
-      border-color: transparent;
-      padding: 0.35rem 0.4rem;
     }
-    .file-item.dir-item:hover { background: transparent; border-color: transparent; }
-    .file-item.dir-child-hidden { display: none; }
-    .file-item.selected { border-color: rgba(52,211,153,0.3); background: var(--accent-softer); }
-    .indent-1 { margin-left: 1.2rem; }
-    .indent-2 { margin-left: 2.4rem; }
-    .indent-3 { margin-left: 3.6rem; }
+    .file-item.selected { background: var(--accent-softer); }
 
-    .file-content-wrapper { flex: 1; min-width: 0; }
-    .file-name { font-size: 0.9rem; font-weight: 500; word-break: break-all; color: var(--text); line-height: 1.4; }
-    .file-meta { color: var(--text-3); font-size: 0.76rem; margin-top: 4px; line-height: 1.6; }
-    .file-path { color: var(--text-2); margin-bottom: 2px; word-break: break-all; }
-    .file-dl {
-      color: var(--accent);
-      font-size: 0.8rem;
-      font-weight: 500;
-      white-space: nowrap;
-      padding: 0.3rem 0.7rem;
-      border-radius: 8px;
-      background: var(--accent-softer);
-      opacity: 0;
-      transition: opacity 0.15s;
-    }
-    .file-item:hover .file-dl { opacity: 1; }
-
-    .dir-name {
-      flex: 1;
+    .file-col-name {
       display: flex;
       align-items: center;
-      gap: 8px;
-      color: var(--text-2);
-      font-size: 0.88rem;
-      font-weight: 600;
-      user-select: none;
+      gap: 0.85rem;
+      min-width: 0;
     }
-    .dir-toggle { cursor: pointer; }
-    .dir-chevron { width: 16px; height: 16px; transition: transform 0.2s ease; flex-shrink: 0; }
-    .dir-item.collapsed .dir-chevron { transform: rotate(-90deg); }
+    .file-content-wrapper {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.24rem;
+    }
+    .file-name {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--text);
+      line-height: 1.35;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .file-meta {
+      color: var(--text-3);
+      font-size: 0.76rem;
+      line-height: 1.5;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      min-width: 0;
+    }
+    .file-path {
+      color: var(--text-2);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+      flex: 1;
+    }
+    .file-path-sep { color: var(--text-3); flex-shrink: 0; }
+    .file-col {
+      font-size: 0.83rem;
+      color: var(--text-2);
+      white-space: nowrap;
+    }
+    .file-col-size, .file-col-action { text-align: right; }
+    .file-col-size { color: var(--text); font-variant-numeric: tabular-nums; }
+    .file-col-modified { font-variant-numeric: tabular-nums; }
+    .file-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.04);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      color: var(--text-2);
+    }
+    .file-icon.kind-dir {
+      color: var(--accent);
+      background: rgba(52,211,153,0.08);
+      border-color: rgba(52,211,153,0.18);
+    }
+    .file-icon.kind-image,
+    .file-icon.kind-video,
+    .file-icon.kind-audio {
+      color: #7dd3fc;
+      background: rgba(125,211,252,0.08);
+      border-color: rgba(125,211,252,0.16);
+    }
+    .file-icon.kind-document,
+    .file-icon.kind-text {
+      color: #fbbf24;
+      background: rgba(251,191,36,0.08);
+      border-color: rgba(251,191,36,0.15);
+    }
+    .file-icon.kind-archive {
+      color: #f472b6;
+      background: rgba(244,114,182,0.08);
+      border-color: rgba(244,114,182,0.16);
+    }
+    .file-icon.kind-code,
+    .file-icon.kind-data {
+      color: #c084fc;
+      background: rgba(192,132,252,0.08);
+      border-color: rgba(192,132,252,0.16);
+    }
+    .file-action-btn {
+      justify-self: end;
+      min-width: 74px;
+      text-align: center;
+    }
+    .file-item.dir-item .file-col-size {
+      color: var(--text-3);
+    }
 
-    .file-checkbox { display: none; position: absolute; left: 10px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; cursor: pointer; z-index: 10; opacity: 0; }
+    .file-checkbox {
+      position: absolute;
+      left: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 18px;
+      height: 18px;
+      cursor: pointer;
+      z-index: 10;
+      opacity: 0;
+      pointer-events: none;
+    }
     .file-checkbox-label {
       display: none;
       position: absolute;
-      left: 10px;
+      left: 12px;
       top: 50%;
       transform: translateY(-50%);
       width: 20px;
@@ -482,10 +580,7 @@
     .file-checkbox:checked + .file-checkbox-label { background: var(--accent); border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-softer); }
     .file-checkbox:checked + .file-checkbox-label svg { opacity: 1; }
     .file-list.selection-mode .file-item { padding-left: 44px; }
-    .file-list.selection-mode .file-item.dir-item { padding-left: 32px; }
-    .file-list.selection-mode .file-checkbox,
     .file-list.selection-mode .file-checkbox-label { display: flex; }
-    .file-list.selection-mode .dir-item .file-checkbox,
     .file-list.selection-mode .dir-item .file-checkbox-label { display: none !important; }
 
     .text-compose {
@@ -572,8 +667,8 @@
       }
       .selection-actions, .section-actions { justify-content: space-between; }
       .selection-bar { gap: 0.75rem; padding: 0.8rem 1rem; }
-      .file-item { padding: 0.7rem 0.85rem; }
-      .file-dl { opacity: 0.7; }
+      .file-table-header, .file-item { min-width: 760px; }
+      .file-browser-scroll, .text-list { max-height: 58vh; }
       .pin-input { width: 44px; height: 52px; }
     }
   </style>
@@ -681,16 +776,49 @@
         </div>
         <div class="toolbar">
           <input id="file-search-input" class="toolbar-input" type="search" placeholder="搜索文件名或路径">
+          <select id="file-type-filter" class="toolbar-select">
+            <option value="all">全部类型</option>
+            <option value="file">仅文件</option>
+            <option value="dir">仅文件夹</option>
+            <option value="document">文档</option>
+            <option value="image">图片</option>
+            <option value="video">视频</option>
+            <option value="audio">音频</option>
+            <option value="archive">压缩包</option>
+            <option value="code">代码</option>
+            <option value="other">其他</option>
+          </select>
+          <select id="file-date-filter" class="toolbar-select">
+            <option value="all">全部时间</option>
+            <option value="24h">最近 24 小时</option>
+            <option value="7d">最近 7 天</option>
+            <option value="30d">最近 30 天</option>
+            <option value="90d">最近 90 天</option>
+          </select>
           <select id="file-sort-select" class="toolbar-select">
-            <option value="tree">树状视图</option>
-            <option value="name">按名称排序</option>
             <option value="modified-desc">最近修改优先</option>
+            <option value="modified-asc">最早修改优先</option>
+            <option value="name-asc">名称 A-Z</option>
+            <option value="name-desc">名称 Z-A</option>
+            <option value="type-asc">按类型排序</option>
+            <option value="size-asc">小文件优先</option>
             <option value="size-desc">大文件优先</option>
           </select>
         </div>
-        <ul class="file-list" id="file-list">
-          <li class="loading">加载中...</li>
-        </ul>
+        <div class="file-browser">
+          <div class="file-browser-scroll">
+            <div class="file-table-header" aria-hidden="true">
+              <span>名称</span>
+              <span>类型</span>
+              <span>修改时间</span>
+              <span class="file-header-size">大小</span>
+              <span class="file-header-action">操作</span>
+            </div>
+            <ul class="file-list" id="file-list">
+              <li class="loading">加载中...</li>
+            </ul>
+          </div>
+        </div>
       </div>
 
       <div class="panel">

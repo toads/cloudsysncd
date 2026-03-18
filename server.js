@@ -30,7 +30,10 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const sharedDir = path.resolve(process.env.SHARED_DIR || path.join(__dirname, 'shared'));
 const repoSharedSourceDir = path.resolve(path.join(__dirname, 'shared'));
-const INTERNAL_SHARED_RELATIVE_PATHS = new Set(
+const HIDDEN_SHARED_RELATIVE_PATHS = new Set(
+  sharedDir === repoSharedSourceDir ? ['sync_download.py', '__pycache__'] : []
+);
+const PROTECTED_SHARED_RELATIVE_PATHS = new Set(
   sharedDir === repoSharedSourceDir ? ['sync_download.py'] : []
 );
 
@@ -102,11 +105,35 @@ function serializeDevice(device) {
   };
 }
 
+function normalizeSharedRelPath(relPath) {
+  return String(relPath || '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '');
+}
+
+function matchesSharedRelPath(relPath, protectedPaths) {
+  const normalized = normalizeSharedRelPath(relPath);
+  for (const entry of protectedPaths) {
+    if (normalized === entry || normalized.startsWith(`${entry}/`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isHiddenSharedRelPath(relPath) {
+  return matchesSharedRelPath(relPath, HIDDEN_SHARED_RELATIVE_PATHS);
+}
+
+function isProtectedSharedRelPath(relPath) {
+  return matchesSharedRelPath(relPath, PROTECTED_SHARED_RELATIVE_PATHS);
+}
+
 function isInternalSharedRelPath(relPath) {
   const normalized = String(relPath || '')
     .replace(/\\/g, '/')
     .replace(/^\/+/, '');
-  return INTERNAL_SHARED_RELATIVE_PATHS.has(normalized);
+  return isHiddenSharedRelPath(normalized);
 }
 
 // Master key: generated once, persisted forever
@@ -600,11 +627,11 @@ function walkDir(dir, prefix = '') {
     const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
     if (isInternalSharedRelPath(relPath)) continue;
     const fullPath = path.join(dir, entry.name);
+    const stat = fs.statSync(fullPath);
     if (entry.isDirectory()) {
-      results.push({ name: relPath, type: 'dir' });
+      results.push({ name: relPath, type: 'dir', modified: stat.mtime.toISOString() });
       results = results.concat(walkDir(fullPath, relPath));
     } else if (entry.isFile()) {
-      const stat = fs.statSync(fullPath);
       results.push({ name: relPath, type: 'file', size: stat.size, modified: stat.mtime.toISOString() });
     }
   }

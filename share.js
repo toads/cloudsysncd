@@ -19,15 +19,42 @@ function resolveSharedDir() {
 
 const sharedDir = resolveSharedDir();
 const repoSharedSourceDir = path.resolve(path.join(__dirname, 'shared'));
-const INTERNAL_SHARED_RELATIVE_PATHS = new Set(
+const HIDDEN_SHARED_RELATIVE_PATHS = new Set(
+  sharedDir === repoSharedSourceDir ? ['sync_download.py', '__pycache__'] : []
+);
+const PROTECTED_SHARED_RELATIVE_PATHS = new Set(
   sharedDir === repoSharedSourceDir ? ['sync_download.py'] : []
 );
+
+function normalizeSharedRelPath(relPath) {
+  return String(relPath || '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '');
+}
+
+function matchesSharedRelPath(relPath, protectedPaths) {
+  const normalized = normalizeSharedRelPath(relPath);
+  for (const entry of protectedPaths) {
+    if (normalized === entry || normalized.startsWith(`${entry}/`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isHiddenSharedRelPath(relPath) {
+  return matchesSharedRelPath(relPath, HIDDEN_SHARED_RELATIVE_PATHS);
+}
+
+function isProtectedSharedRelPath(relPath) {
+  return matchesSharedRelPath(relPath, PROTECTED_SHARED_RELATIVE_PATHS);
+}
 
 function isInternalSharedRelPath(relPath) {
   const normalized = String(relPath || '')
     .replace(/\\/g, '/')
     .replace(/^\/+/, '');
-  return INTERNAL_SHARED_RELATIVE_PATHS.has(normalized);
+  return isHiddenSharedRelPath(normalized);
 }
 
 const args = process.argv.slice(2);
@@ -51,7 +78,7 @@ if (args[0] === '--list') {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
       if (e.name.startsWith('.')) continue;
       const rel = prefix ? `${prefix}/${e.name}` : e.name;
-      if (isInternalSharedRelPath(rel)) continue;
+      if (isHiddenSharedRelPath(rel)) continue;
       if (e.isDirectory()) {
         walk(path.join(dir, e.name), rel);
       } else {
@@ -69,7 +96,7 @@ if (args[0] === '--clear') {
   if (fs.existsSync(sharedDir)) {
     for (const entry of fs.readdirSync(sharedDir, { withFileTypes: true })) {
       if (entry.name.startsWith('.')) continue;
-      if (isInternalSharedRelPath(entry.name)) continue;
+      if (isProtectedSharedRelPath(entry.name)) continue;
       fs.rmSync(path.join(sharedDir, entry.name), { recursive: true, force: true });
     }
   }
