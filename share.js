@@ -2,22 +2,38 @@
 const fs = require('fs');
 const path = require('path');
 
-const sharedDir = path.resolve(process.env.SHARED_DIR || path.join(__dirname, 'shared'));
+function resolveSharedDir() {
+  if (process.env.SHARED_DIR) {
+    return path.resolve(process.env.SHARED_DIR);
+  }
+
+  const localDir = path.join(__dirname, 'shared');
+  const dockerDir = path.join(__dirname, '.local', 'shared');
+  const dockerToken = path.join(__dirname, '.local', 'data', '.admin-token');
+
+  if (fs.existsSync(dockerToken)) {
+    return dockerDir;
+  }
+  return localDir;
+}
+
+const sharedDir = resolveSharedDir();
 
 const args = process.argv.slice(2);
 
 if (args.length === 0) {
+  const displayDir = path.relative(process.cwd(), sharedDir) || '.';
   console.log('用法:');
-  console.log('  node share.js file1.pdf dir/ file2.txt  — 复制到 shared/');
+  console.log(`  node share.js file1.pdf dir/ file2.txt  — 复制到 ${displayDir}/`);
   console.log('  node share.js --list                    — 列出共享文件');
-  console.log('  node share.js --clear                   — 清空 shared/');
+  console.log(`  node share.js --clear                   — 清空 ${displayDir}/`);
   process.exit(0);
 }
 
 // --list: show current shared files
 if (args[0] === '--list') {
   if (!fs.existsSync(sharedDir)) {
-    console.log('shared/ 目录为空');
+    console.log(`${path.relative(process.cwd(), sharedDir) || '.'}/ 目录为空`);
     process.exit(0);
   }
   const walk = (dir, prefix = '') => {
@@ -42,7 +58,7 @@ if (args[0] === '--clear') {
     fs.rmSync(sharedDir, { recursive: true });
   }
   fs.mkdirSync(sharedDir, { recursive: true });
-  console.log('shared/ 已清空');
+  console.log(`${path.relative(process.cwd(), sharedDir) || '.'}/ 已清空`);
   process.exit(0);
 }
 
@@ -68,7 +84,7 @@ for (const src of args) {
   count++;
 }
 
-console.log(`共复制 ${count} 项到 shared/`);
+console.log(`共复制 ${count} 项到 ${path.relative(process.cwd(), sharedDir) || '.'}/`);
 
 function formatSize(n) {
   if (n < 1024) return `${n} B`;

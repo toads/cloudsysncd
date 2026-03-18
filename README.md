@@ -11,7 +11,7 @@
 - 浏览器端 PIN 配对
 - `shared/` 目录文件共享
 - 单文件下载和批量下载
-- 文本共享接口
+- 文本共享 API
 - Python 自动轮询下载脚本
 
 ## 目录说明
@@ -64,6 +64,7 @@ docker compose up --build -d
 - 服务监听 `21891`
 - 运行时数据写入 `./.local/data`
 - 共享文件目录映射到 `./.local/shared`
+- 宿主机侧 `node pin.js` 和 `node share.js` 会优先识别这套 Docker Compose 运行时目录
 
 启动后可以通过下面的命令看健康状态：
 
@@ -204,5 +205,6 @@ git ls-files
 - 浏览器端会把主密钥保存在 IndexedDB
 - Python 客户端会把主密钥保存在下载目录
 - 客户端解密阶段仍需要在本地持有完整响应内容
+- 文本共享目前只暴露服务端 API，还没有对应的 Web 页面入口
 
 这些问题的详细说明见 [OPEN_SOURCE_AUDIT.md](./OPEN_SOURCE_AUDIT.md)。

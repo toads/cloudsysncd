@@ -672,6 +672,24 @@ const toggleSelectionModeBtn = document.getElementById('toggle-selection-mode-bt
 const closeTopSelectionBtn = document.getElementById('close-top-selection-btn');
 const clearSelectionBtn = document.getElementById('clear-selection-btn');
 
+function exitSelectionMode({ clear = true } = {}) {
+  selectionMode = false;
+  const listEl = document.getElementById('file-list');
+  listEl?.classList.remove('selection-mode');
+  selectionBar?.classList.remove('active');
+  topSelectionBar?.classList.remove('active');
+  if (toggleSelectionModeBtn) toggleSelectionModeBtn.textContent = '选择';
+
+  if (clear) {
+    clearSelection();
+  } else {
+    updateSelectionUI();
+  }
+
+  const topSelectionText = document.getElementById('top-selection-text');
+  if (topSelectionText) topSelectionText.textContent = '选择文件';
+}
+
 function updateSelectionUI() {
   const count = selectedFiles.size;
   selectionCountEl.textContent = count;
@@ -699,10 +717,9 @@ function toggleSelection(fileList, name, li) {
 }
 
 function toggleSelectionMode() {
-  selectionMode = !selectionMode;
-  const listEl = document.getElementById('file-list');
-
-  if (selectionMode) {
+  if (!selectionMode) {
+    selectionMode = true;
+    const listEl = document.getElementById('file-list');
     listEl.classList.add('selection-mode');
     toggleSelectionModeBtn.textContent = '完成';
     topSelectionBar.classList.add('active');
@@ -710,13 +727,7 @@ function toggleSelectionMode() {
     // Update text based on current selection
     document.getElementById('top-selection-text').textContent = `已选择 ${selectedFiles.size} 项`;
   } else {
-    listEl.classList.remove('selection-mode');
-    selectedFiles.clear();
-    toggleSelectionModeBtn.textContent = '选择';
-    selectionBar.classList.remove('active');
-    topSelectionBar.classList.remove('active');
-    selectionCountEl.textContent = '0';
-    document.getElementById('top-selection-text').textContent = '选择文件';
+    exitSelectionMode({ clear: true });
   }
 }
 
@@ -805,11 +816,7 @@ function setupEventListeners() {
   // Close top selection bar
   if (closeTopSelectionBtn) {
     closeTopSelectionBtn.addEventListener('click', () => {
-      selectionMode = false;
-      document.getElementById('file-list').classList.remove('selection-mode');
-      topSelectionBar.classList.remove('active');
-      selectionBar.classList.remove('active');
-      updateSelectionUI();
+      exitSelectionMode({ clear: true });
     });
   }
 
@@ -855,10 +862,7 @@ function setupEventListeners() {
   if (selectionBar) {
     selectionBar.addEventListener('click', (e) => {
       if (e.target === selectionBar) {
-        selectionMode = false;
-        document.getElementById('file-list').classList.remove('selection-mode');
-        selectionBar.classList.remove('active');
-        updateSelectionUI();
+        exitSelectionMode({ clear: true });
       }
     });
   }

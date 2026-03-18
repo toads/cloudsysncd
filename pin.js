@@ -3,7 +3,23 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 21891;
-const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
+function resolveDataDir() {
+  if (process.env.DATA_DIR) {
+    return path.resolve(process.env.DATA_DIR);
+  }
+
+  const localDir = path.join(__dirname, 'data');
+  const dockerDir = path.join(__dirname, '.local', 'data');
+  const localToken = path.join(localDir, '.admin-token');
+  const dockerToken = path.join(dockerDir, '.admin-token');
+
+  if (!fs.existsSync(localToken) && fs.existsSync(dockerToken)) {
+    return dockerDir;
+  }
+  return localDir;
+}
+
+const dataDir = resolveDataDir();
 const tokenFile = path.join(dataDir, '.admin-token');
 
 let token;
