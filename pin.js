@@ -3,7 +3,8 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 21891;
-const tokenFile = path.join(__dirname, 'data', '.admin-token');
+const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
+const tokenFile = path.join(dataDir, '.admin-token');
 
 let token;
 try {

@@ -1,0 +1,24 @@
+name: cloudsysncd
+
+services:
+  cloudsysncd:
+    build:
+      context: .
+    image: cloudsysncd:local
+    container_name: cloudsysncd
+    ports:
+      - "${PORT:-21891}:${PORT:-21891}"
+    environment:
+      PORT: ${PORT:-21891}
+      DATA_DIR: /app/runtime/data
+      SHARED_DIR: /app/runtime/shared
+    volumes:
+      - ./.local/data:/app/runtime/data
+      - ./.local/shared:/app/runtime/shared
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:' + (process.env.PORT || 21891) + '/healthz').then((res) => process.exit(res.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped

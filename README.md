@@ -43,6 +43,36 @@ npm start
 3. 在网页输入 PIN 完成配对
 4. 把要共享的文件放入 `shared/`，或者使用 `node share.js ...`
 
+如果你想先验证本地启动链路是否正常，可以运行：
+
+```bash
+npm run smoke
+```
+
+这个命令会使用临时目录和临时端口启动服务，并检查 `GET /healthz` 是否正常返回。
+
+## Docker 快速启动
+
+如果你更希望直接通过容器运行：
+
+```bash
+docker compose up --build -d
+```
+
+默认情况下：
+
+- 服务监听 `21891`
+- 运行时数据写入 `./.local/data`
+- 共享文件目录映射到 `./.local/shared`
+
+启动后可以通过下面的命令看健康状态：
+
+```bash
+curl http://127.0.0.1:21891/healthz
+```
+
+如果你要公开暴露这个 Docker 实例，仍然建议把公网入口放在 Cloudflare Tunnel 前面，而不是直接把容器端口裸露到公网。
+
 ## 常用命令
 
 复制文件或目录到共享目录：
@@ -99,9 +129,25 @@ SYNCD_SERVER=http://127.0.0.1:21891 python3 shared/sync_download.py --interval 6
 ## 环境变量
 
 - `PORT`: 服务端监听端口，默认 `21891`
+- `DATA_DIR`: 服务端运行时状态目录，默认 `./data`
+- `SHARED_DIR`: 服务端共享文件目录，默认 `./shared`
 - `SYNCD_SERVER`: Python 客户端访问的服务端地址
 
 如果你要使用自定义 Cloudflare 域名或 `trycloudflare`，还需要先在本机安装 `cloudflared`。
+
+## 健康检查
+
+服务端提供一个不需要配对的探活接口：
+
+```bash
+GET /healthz
+```
+
+它会返回最小运行信息，例如服务名、版本、是否已有配对设备，以及当前进程运行时间。这个接口主要用于：
+
+- Docker healthcheck
+- CI smoke test
+- 本地部署排障
 
 ## 部署方案
 

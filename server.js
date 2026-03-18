@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { pipeline } = require('stream');
 const tar = require('tar');
+const packageJson = require('./package.json');
 
 const app = express();
 app.use(express.json({
@@ -22,9 +23,9 @@ const MAX_NONCES_PER_DEVICE = 512;
 let activeDownloads = 0;
 const seenRequestNonces = new Map();
 
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
-const sharedDir = path.join(__dirname, 'shared');
+const sharedDir = path.resolve(process.env.SHARED_DIR || path.join(__dirname, 'shared'));
 
 // ============ Persistent State ============
 
@@ -284,6 +285,17 @@ app.get('/api/status', (req, res) => {
   res.json({ paired: devices.length > 0 });
 });
 
+app.get('/healthz', (req, res) => {
+  res.json({
+    ok: true,
+    service: packageJson.name,
+    version: packageJson.version,
+    paired: devices.length > 0,
+    pendingPair: !!pendingPair,
+    uptimeSeconds: Math.floor(process.uptime()),
+  });
+});
+
 app.get('/api/pair/init', (req, res) => {
   if (!pendingPair) {
     return res.status(400).json({ error: 'No active pairing session. Generate a new PIN on the server.' });
@@ -484,6 +496,7 @@ app.get('/api/texts', requireDeviceAuth, (req, res) => {
 const PORT = process.env.PORT || 21891;
 app.listen(PORT, () => {
   console.log(`cloudsysncd server running on http://localhost:${PORT}`);
+  console.log(`Data directory: ${DATA_DIR}`);
   console.log(`Shared directory: ${sharedDir}`);
   console.log(`Paired devices: ${devices.length}`);
   if (devices.length === 0) {

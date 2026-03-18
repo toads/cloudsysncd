@@ -2,7 +2,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const sharedDir = path.join(__dirname, 'shared');
+const sharedDir = path.resolve(process.env.SHARED_DIR || path.join(__dirname, 'shared'));
 
 const args = process.argv.slice(2);
 

@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.git
+.github
+.claude
+.DS_Store
+data
+.local
+shared/*
+!shared/sync_download.py

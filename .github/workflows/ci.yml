@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check server syntax
+        run: node --check server.js
+
+      - name: Check browser bundle syntax
+        run: node --check public/app.js
+
+      - name: Check helper script syntax
+        run: node --check pin.js
+
+      - name: Check share helper syntax
+        run: node --check share.js
+
+      - name: Check smoke test syntax
+        run: node --check scripts/smoke-test.js
+
+      - name: Compile Python client
+        run: python3 -m py_compile shared/sync_download.py
+
+      - name: Audit npm dependencies
+        run: npm audit --registry=https://registry.npmjs.org
+
+      - name: Run smoke test
+        run: npm run smoke

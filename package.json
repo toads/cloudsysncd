@@ -2,11 +2,12 @@
   "name": "cloudsysncd",
   "version": "1.0.0",
   "description": "Encrypted file sync and share service with PIN pairing and Cloudflare Tunnel support.",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon --watch server.js --watch public server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "smoke": "node scripts/smoke-test.js",
+    "test": "npm run smoke"
   },
   "keywords": [],
   "author": "",
