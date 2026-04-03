@@ -337,7 +337,15 @@
       padding: 0.78rem 0.92rem;
       font-size: 0.9rem;
     }
-    .toolbar-select { appearance: none; }
+    .toolbar-select {
+      appearance: none;
+      background-color: var(--bg-subtle);
+      color-scheme: dark;
+    }
+    .toolbar-select option {
+      background-color: var(--bg-subtle);
+      color: var(--text);
+    }
 
     .btn-secondary, .dir-action {
       background: var(--surface);
@@ -404,9 +412,9 @@
     .file-browser-scroll::-webkit-scrollbar-thumb, .text-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 999px; }
 
     .file-table-header, .file-item {
-      min-width: 860px;
+      min-width: 640px;
       display: grid;
-      grid-template-columns: minmax(320px, 3.2fr) 132px 180px 110px 96px;
+      grid-template-columns: minmax(180px, 3fr) 120px 162px 96px 84px;
       gap: 0.85rem;
       align-items: center;
     }
@@ -667,7 +675,7 @@
       }
       .selection-actions, .section-actions { justify-content: space-between; }
       .selection-bar { gap: 0.75rem; padding: 0.8rem 1rem; }
-      .file-table-header, .file-item { min-width: 760px; }
+      .file-table-header, .file-item { min-width: 520px; }
       .file-browser-scroll, .text-list { max-height: 58vh; }
       .pin-input { width: 44px; height: 52px; }
     }

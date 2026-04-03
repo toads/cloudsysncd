@@ -100,6 +100,12 @@ function safeDecodeHeader(value) {
   }
 }
 
+function createDomSafeId(prefix, value) {
+  const bytes = new TextEncoder().encode(String(value));
+  const encoded = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${prefix}-${encoded}`;
+}
+
 async function sha256Hex(data) {
   const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
   const digest = await window.crypto.subtle.digest('SHA-256', bytes);
@@ -914,7 +920,7 @@ function createFileItemMarkup(entry) {
   const parentPath = getEntryParentPath(entry);
   const escapedName = escapeHtml(baseName);
   const escapedFullPath = escapeHtml(entry.name);
-  const checkboxId = `file-${btoa(entry.name).replace(/=+$/, '')}`;
+  const checkboxId = createDomSafeId('file', entry.name);
   const typeKey = getEntryTypeKey(entry);
   const typeLabel = escapeHtml(getEntryTypeLabel(entry));
   const modifiedLabel = escapeHtml(formatEntryModified(entry));
