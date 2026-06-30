@@ -180,16 +180,41 @@ async function main() {
     if (encrypted[0] !== 0x53 || encrypted[1] !== 0x59 || encrypted[2] !== 0x4E || encrypted[3] !== 0x43) {
       throw new Error('Invalid magic');
     }
-    const chunkSize = (encrypted[5] << 24) | (encrypted[6] << 16) | (encrypted[7] << 8) | encrypted[8];
+    const chunkSize = encrypted.readUInt32BE(5);
     console.log(`Chunk size: ${chunkSize}`);
 
     let offset = 16;
     const decryptedChunks = [];
+    let decryptedChunkCount = 0;
+    let finalized = false;
     while (offset < encrypted.length) {
+      if (offset + 16 > encrypted.length) throw new Error('Truncated chunk frame header');
       const iv = encrypted.subarray(offset, offset + 12);
       offset += 12;
-      const len = (encrypted[offset] << 24) | (encrypted[offset + 1] << 16) | (encrypted[offset + 2] << 8) | encrypted[offset + 3];
+      const len = encrypted.readUInt32BE(offset);
       offset += 4;
+
+      if (len === 0xffffffff) {
+        if (offset + 12 + 16 > encrypted.length) throw new Error('Truncated final chunk frame');
+        const ciphertext = encrypted.subarray(offset, offset + 12);
+        offset += 12;
+        const tag = encrypted.subarray(offset, offset + 16);
+        offset += 16;
+        const decipher = crypto.createDecipheriv('aes-256-gcm', masterKey, iv);
+        decipher.setAAD(Buffer.from('SYNC-FINAL-v1'));
+        decipher.setAuthTag(tag);
+        const finalPlaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+        const expectedChunks = Number(finalPlaintext.readBigUInt64BE(0));
+        const expectedChunkSize = finalPlaintext.readUInt32BE(8);
+        if (expectedChunks !== decryptedChunkCount || expectedChunkSize !== chunkSize) {
+          throw new Error('Invalid chunked AEAD final frame');
+        }
+        finalized = true;
+        if (offset !== encrypted.length) throw new Error('Trailing data after final frame');
+        break;
+      }
+
+      if (offset + len + 16 > encrypted.length) throw new Error('Truncated chunk frame body');
       const ciphertext = encrypted.subarray(offset, offset + len);
       offset += len;
       const tag = encrypted.subarray(offset, offset + 16);
@@ -197,7 +222,9 @@ async function main() {
       const decipher = crypto.createDecipheriv('aes-256-gcm', masterKey, iv);
       decipher.setAuthTag(tag);
       decryptedChunks.push(Buffer.concat([decipher.update(ciphertext), decipher.final()]));
+      decryptedChunkCount++;
     }
+    if (!finalized) throw new Error('Missing chunked AEAD final frame');
     const decrypted = Buffer.concat(decryptedChunks);
     if (!decrypted.equals(original)) throw new Error('Decrypted content mismatch');
     console.log(`Chunked download test passed: ${decrypted.length} bytes`);

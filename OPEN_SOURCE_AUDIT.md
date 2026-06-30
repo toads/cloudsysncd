@@ -1,281 +1,125 @@
 # cloudsysncd 开源前安全与合规审计
 
-审计日期：2026-03-12  
+审计日期：2026-06-30
 仓库状态：面向 GitHub 公开发布整理中
 
 ## 审计范围
 
-- Git 历史与当前工作区
-- 服务端与客户端代码
-- 依赖与许可证现状
-- 对外暴露、域名与部署方式
+- 当前源码树与可发布包配置
+- 服务端、浏览器端、Python 客户端和 TX relay 通道
+- 依赖、许可证、运行态数据隔离和默认部署边界
 
 ## 结论摘要
 
-这个仓库可以整理后开源，但不建议按当前状态直接发布或直接公网暴露。`git` 历史本身比较干净，真正的风险主要在：
+当前仓库可以整理后开源，但仍不建议在没有额外访问控制的情况下直接公网暴露。已完成的关键加固包括：
 
-1. Python 客户端默认关闭 TLS 校验，这是当前接受的业务风险
-2. 已补上逐请求 HMAC 验签，但仍缺少完整的设备撤销和密钥轮换能力
-3. `shared/` 同时承担运行时共享目录和仓库目录，容易误提交样本与审计资料
-4. `tar` 高危依赖已在本次清理中升级到安全版本
-5. `LICENSE` 仍缺失，发布前还需要补齐
+1. 配对后接口使用 `deviceId + timestamp + nonce + HMAC` 做逐请求鉴权。
+2. 大文件走流式加密响应，避免服务端整包缓冲。
+3. chunked AEAD 增加认证结束帧，客户端会拒绝截断或尾部污染的数据。
+4. TX relay 支持独立 access key HMAC，管理接口不会被 relay 代理。
+5. 运行态状态文件、分享 token、云存储索引使用私有权限写入。
+6. `Dockerfile`、`.gitignore`、`.env.example` 和 npm 包发布白名单已补齐。
+7. `LICENSE` 已存在，`package.json` 使用 ISC。
 
-## 一、Git 历史与敏感信息
+仍需明确接受或后续补齐的边界：
 
-### 1. Git 历史结论
+- Python 客户端为了自签名和内网部署兼容，仍允许关闭 TLS 校验；公网使用应显式启用 TLS 校验。
+- 服务端、浏览器 IndexedDB、Python 状态目录会长期保存同一个 master key；当前没有主密钥轮换机制。
+- 设备撤销已可用，但还没有完整的图形化设备管理和密钥轮换流程。
+- HTTP relay fallback 只适合被浏览器明确加入可信不安全源的场景；否则应使用 HTTPS relay。
 
-- 当前历史只有 1 个提交：`f08966f`
-- 已跟踪文件仅 10 个，未包含 `data/`、数据库、私钥文件或证书
-- 使用模式扫描检查了常见 token、私钥头、数据库连接串、Bearer token、密码字面量
-- 结论：没有在 Git 历史中发现明确的已提交密钥
+## 一、敏感信息与运行态数据
 
-### 2. 当前工作区敏感内容
+`.gitignore` 已覆盖主要运行态与凭证文件：
 
-虽然历史里没有已提交密钥，但当前工作区存在敏感运行态文件和大体积样本：
+- `data/`、`.local/`
+- `shared/*`，但保留 `shared/sync_download.py`
+- `.env*`，但保留 `.env.example`
+- `.relay*.env`
+- 常见证书和私钥后缀：`*.pem`、`*.key`、`*.p12`、`*.pfx`
+- Python 客户端状态：`.syncd_state.json`、`.syncd_key`
 
-- `data/state.json`
-  - 含 `masterKey`
-  - 含已配对设备清单
-- `data/.admin-token`
-  - 本地管理接口 token
-- `shared/xttest.zip`
-  - 约 79 MB
-- `shared/entry-default-unsigned.hap`
-  - 约 3.8 MB
-- `shared/docs.tar`
-  - 归档文件
-- `shared/*.md`
-  - 多份逆向与漏洞审计材料
+发布前仍建议执行：
 
-这些文件当前没有进入 Git 历史，但如果直接 `git add .`，非常容易被误提交。为降低这个风险，已经把 `shared/*`（保留 `shared/sync_download.py`）以及 `.syncd_key`、`.syncd_state.json` 加入忽略规则。
+```bash
+git status --short
+git ls-files
+npm pack --dry-run --json
+```
 
-## 二、代码安全问题
+确保没有把本地样本、运行态数据、证书、云厂商凭证或下载目录打进 Git/NPM 包。
 
-### 高风险 1: Python 客户端默认关闭 TLS 校验
+## 二、代码安全现状
 
-位置：
+### 已修复：配对后的逐请求鉴权
 
-- `shared/sync_download.py:41`
+保护接口要求携带：
 
-表现：
+- `X-Device-Id`
+- `X-Auth-Timestamp`
+- `X-Auth-Nonce`
+- `X-Auth-Signature`
 
-- `requests.Session().verify = False`
+签名覆盖 `method + path + timestamp + nonce + body hash`，服务端校验设备状态、时间窗和 nonce 重放。
 
-影响：
+### 已修复：下载流式化与完整性检查
 
-- 攻击者可在配对阶段中间人劫持
-- 可替换服务端返回内容
-- 在配对拿到主密钥后，后续所有文件内容都可能被解密或篡改
+- 普通大文件使用流式 AES-GCM 或 chunked AEAD。
+- chunked AEAD 末尾带认证结束帧，浏览器和 Python 客户端都会校验 chunk 数和 chunk 大小。
+- 浏览器下载会校验明文大小，IndexedDB 临时块使用复合 key 避免字典序错序。
+- File System Access API 写入失败时不会再尝试用已消费的流做不可靠降级。
 
-这条问题和公网部署叠加后，风险会显著上升。
+### 已修复：TX relay 滥用防护
 
-备注：
+- relay 请求需要 access key HMAC。
+- access key 通过已配对 E2E 信道加密下发给浏览器，不要求用户手工输入。
+- relay 不会透传 `x-admin-token`。
+- `/api/local/*` 管理接口大小写不敏感地禁止代理。
+- 源站本地管理 API 只接受 loopback 请求。
 
-- 这项风险已被明确标记为业务接受项，本次未修改。
+### 已修复：云存储缓存一致性
 
-### 已修复: 配对后的逐请求鉴权缺失
+- 云存储索引记录 `size + mtimeMs` 文件签名。
+- 源文件变化后不会继续使用旧对象。
+- 对象 key 加随机前缀，避免只由路径哈希决定。
+- 同一路径重新上传成功后会清理被替换的旧对象。
 
-位置：
+### 剩余边界：长期 master key
 
-- 服务端保护接口
-- 浏览器端下载和文件列表请求
-- Python 客户端批量下载请求
+服务端 `data/state.json`、浏览器 IndexedDB、Python `.syncd_key` 都保存同一个长期 master key。设备撤销能阻断后续 HMAC 请求，但已经泄露的 master key 没有自动轮换能力。
 
-处理结果：
+### 剩余边界：默认监听地址
 
-- 现在保护接口要求携带 `X-Device-Id`、`X-Auth-Timestamp`、`X-Auth-Nonce`、`X-Auth-Signature`
-- 签名内容覆盖 `method + path + timestamp + nonce + body hash`
-- 服务端会校验设备存在性、时间窗和 nonce 重放
-- 浏览器端与 Python 客户端都已兼容新的签名流程
+服务端默认 `app.listen(PORT)`，未强制绑定 `127.0.0.1`。推荐生产部署仍放在 Cloudflare Tunnel、反向代理或本机防火墙之后，并叠加访问控制。
 
-剩余限制：
+## 三、合规与发布
 
-- 仍未提供独立的设备撤销界面
-- 仍未实现主密钥轮换
-- 旧版 Python 客户端因为没有保存 `device_id`，升级后需要重新配对一次
+- `LICENSE` 已存在，包声明为 ISC。
+- 前端使用系统字体，不依赖浏览器默认不会加载的第三方字体。
+- `package.json` 增加 `files` 白名单，降低 `npm pack` 误带运行态文件的概率。
+- `package-lock.json` 应保持官方 npm registry 的 resolved URL，避免发布时固定到个人或区域镜像。
 
-### 高风险 3: 仓库目录和运行态共享目录混用
+## 四、建议的发布前检查
 
-位置：
+```bash
+npm audit --registry=https://registry.npmjs.org --omit=dev --audit-level=moderate
+npm test
+npm run test:chunked
+npm run test:security-relay
+npm pack --dry-run --json
+```
 
-- `server.js:21`
-- `server.js:211`
-- `server.js:193`
-- `shared/`
+如果要验证真实 TX relay 链路：
 
-表现：
+```bash
+RELAY_E2E_URL=https://... \
+RELAY_E2E_KEY=... \
+RELAY_E2E_ACCESS_KEY=... \
+npm run test:e2e-relay-tx
+```
 
-- `shared/` 既是 Git 工作区目录，也是服务端实际共享目录
-- 当前 `shared/` 下除了客户端脚本，还堆放了 HAP、ZIP、报告、tar 包
+`test:e2e-relay-tx` 默认不会操作本机 launchd；只有显式设置 `RELAY_E2E_MANAGE_LAUNCHD=true` 才会临时卸载并恢复指定 agent。
 
-影响：
+## 五、是否可以开源
 
-- 容易把本地样本、逆向资料、第三方产物误公开到 GitHub
-- 也容易在服务运行时被所有已配对设备下载
-- 对开源仓库而言，这是明显的数据边界混乱
-
-建议把运行态共享目录独立为未跟踪路径，例如 `runtime/shared/` 或用户家目录下的专用目录。
-
-### 已修复: `tar` 依赖漏洞
-
-检查方式：
-
-- `npm audit --registry=https://registry.npmjs.org --json`
-
-结果：
-
-- `tar` 被报告为 1 个高危直接依赖
-- GHSA:
-  - `GHSA-qffp-2rhf-9h96`
-  - `GHSA-9ppj-qmqm-q256`
-
-处理结果：
-
-- 已升级到 `tar@7.5.11`
-- 升级后 `npm audit` 返回 `found 0 vulnerabilities`
-
-### 已修复: 服务端下载接口的内存堆积风险
-
-位置：
-
-- 旧实现位于 `server.js` 的单文件和批量下载路径
-
-处理结果：
-
-- 已改为边加密边输出的流式响应
-- 不再在服务端内存中累积整份密文
-- 前端和 Python 客户端已同步兼容新的流式协议
-
-### 中风险 6: 客户端长期保存主密钥，且没有轮换机制
-
-位置：
-
-- `public/app.js:196`
-- `public/app.js:676-683`
-- `shared/sync_download.py:151-167`
-
-表现：
-
-- 浏览器把主密钥存入 IndexedDB
-- Python 客户端把主密钥写入 `.syncd_key`
-- 服务端把主密钥长期写入 `data/state.json`
-
-影响：
-
-- 设备丢失、浏览器数据泄露、终端被入侵后，主密钥可能长期有效
-- 当前没有密钥轮换和设备吊销流程
-
-### 中风险 7: 服务默认绑定所有网卡
-
-位置：
-
-- `server.js:364-365`
-
-表现：
-
-- `app.listen(PORT)` 未显式限制监听地址
-
-影响：
-
-- 只要主机网络可达，服务就可能被其他设备访问
-- 如果再通过端口映射或隧道暴露，风险会进一步放大
-
-## 三、合规与发布问题
-
-### 1. 缺少 LICENSE
-
-现状：
-
-- `package.json` 写了 `ISC`
-- 仓库中没有 `LICENSE` 文件
-
-影响：
-
-- GitHub 开源时，外部使用者难以判断授权边界
-- 这属于典型的开源合规缺口
-
-### 2. 当前前端会请求 Google Fonts
-
-位置：
-
-- `public/index.html:7-8`
-
-影响：
-
-- 浏览器访问时会向 Google 发送请求
-- 会带来额外的第三方网络请求和隐私披露
-- 如果你想强调“纯自托管”或“低外联”，应改为自托管字体或系统字体
-
-### 3. 提交作者邮箱将随公开仓库一起公开
-
-现状：
-
-- 当前唯一提交作者邮箱为 `toadstoolses@gmail.com`
-
-影响：
-
-- 这不属于漏洞，但属于公开发布前应确认的个人信息暴露项
-
-## 四、域名与 Cloudflare 现状
-
-当前仓库不再依赖固定公网域名。
-
-现在的建议方式是：
-
-- 有自定义 Cloudflare 域名时，用你自己的域名
-- 没有自定义域名时，使用 `cloudflared tunnel --url http://127.0.0.1:21891` 获取随机的 `trycloudflare` 地址
-- Python 客户端统一通过 `SYNCD_SERVER` 指定访问地址
-
-## 五、数据库与访问鉴权现状
-
-### 数据库存储
-
-服务端没有引入传统数据库：
-
-- 没有 SQLite/PostgreSQL/MySQL/MongoDB/Redis 依赖
-- 主要状态保存在 `data/state.json`
-- 浏览器端使用 IndexedDB 保存主密钥
-
-因此，这个项目当前的核心问题不是数据库访问控制，而是：
-
-- 文件系统中的主密钥明文持久化
-- 运行态数据与仓库目录混用
-- 配对后缺少持续鉴权
-
-### 鉴权模型
-
-当前实际是“两段式”：
-
-1. 通过 6 位 PIN + ECDH 获取主密钥
-2. 后续访问通过 `deviceId + timestamp + nonce + HMAC` 做逐请求校验
-
-这比之前只检查“是否存在任意已配对设备”要强很多，但它仍不是完整的设备管理系统，因为目前还缺少吊销、轮换和管理面板。
-
-## 六、发布建议
-
-### 必做
-
-1. 升级 `tar`
-2. 给仓库补 `LICENSE`
-3. 将运行态共享目录移出源码树，或至少保持全量忽略
-4. 清空 `shared/` 中的样本与第三方材料后再公开
-
-### 强烈建议
-
-1. 为每个设备签发独立凭证，而不是仅共享一个长期主密钥
-2. 加入设备撤销、主密钥轮换和重新配对机制
-3. 让服务默认只监听 `127.0.0.1`
-4. 对公网部署增加额外访问控制层
-5. 持续保留流式下载实现，不要回退到整包缓冲
-
-## 七、是否可以开源
-
-可以，但建议按以下顺序执行：
-
-1. 先清理工作区运行态文件和样本
-2. 补 LICENSE
-3. 保持依赖为安全版本
-4. 再公开到 GitHub
-
-如果只是“把代码公开供参考”，经过上述整理后可以发布。  
-如果目标是“让别人直接部署到公网使用”，当前版本还不够安全。
+可以作为“自托管、受控网络内的加密同步工具”开源。若目标是让未知用户直接公网部署，还需要继续补齐主密钥轮换、图形化设备管理、默认 loopback 监听或更严格的默认访问控制。

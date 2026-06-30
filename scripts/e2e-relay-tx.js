@@ -13,7 +13,13 @@ const CHUNK_SIZE = 1024 * 1024;
 const RELAY_AGENT_ENV_PATH = process.env.RELAY_AGENT_ENV || path.resolve(__dirname, '..', '.relay-agent.env');
 const RELAY_CLIENT_ENV_PATH = process.env.RELAY_CLIENT_ENV || path.resolve(__dirname, '..', '.relay-client.env');
 const LAUNCHD_LABEL = process.env.RELAY_E2E_LAUNCHD_LABEL || 'com.cloudsysncd.relay-agent';
-const MANAGE_LAUNCHD = process.env.RELAY_E2E_MANAGE_LAUNCHD !== 'false';
+const MANAGE_LAUNCHD = process.env.RELAY_E2E_MANAGE_LAUNCHD === 'true';
+const RELAY_E2E_REQUIRED = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.RELAY_E2E_REQUIRED || '').trim().toLowerCase()
+);
+const RELAY_E2E_USE_ENV_FILES = RELAY_E2E_REQUIRED || ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.RELAY_E2E_USE_ENV_FILES || '').trim().toLowerCase()
+);
 
 let serverChild = null;
 let agentChild = null;
@@ -175,6 +181,12 @@ async function generateRandomFile(filePath, size) {
   }
 }
 
+function skipOrThrow(message) {
+  if (RELAY_E2E_REQUIRED) throw new Error(message);
+  console.log(`TX relay E2E skipped: ${message}`);
+  console.log('Set RELAY_E2E_REQUIRED=true to make missing relay configuration fail the run.');
+}
+
 async function stopChild(child, name) {
   if (!child || child.exitCode !== null) return;
   child.kill('SIGTERM');
@@ -281,15 +293,30 @@ async function startRelayAgent(relayUrl, relayKey, originUrl) {
 }
 
 async function main() {
-  const agentEnv = parseDotEnv(RELAY_AGENT_ENV_PATH);
-  const clientEnv = parseDotEnv(RELAY_CLIENT_ENV_PATH);
+  const hasExplicitConfig = !!(
+    process.env.RELAY_E2E_URL
+    || process.env.RELAY_E2E_KEY
+    || process.env.RELAY_E2E_ACCESS_KEY
+  );
+  if (!RELAY_E2E_REQUIRED && !RELAY_E2E_USE_ENV_FILES && !hasExplicitConfig) {
+    skipOrThrow('explicit relay config not enabled. Set RELAY_E2E_URL/KEY/ACCESS_KEY or RELAY_E2E_USE_ENV_FILES=true.');
+    return;
+  }
+
+  const agentEnv = RELAY_E2E_USE_ENV_FILES ? parseDotEnv(RELAY_AGENT_ENV_PATH) : {};
+  const clientEnv = RELAY_E2E_USE_ENV_FILES ? parseDotEnv(RELAY_CLIENT_ENV_PATH) : {};
   const relayUrl = (process.env.RELAY_E2E_URL || agentEnv.RELAY_URL || clientEnv.SYNCD_SERVER || '').replace(/\/+$/, '');
   const relayKey = process.env.RELAY_E2E_KEY || agentEnv.RELAY_KEY || '';
   const relayAccessKey = process.env.RELAY_E2E_ACCESS_KEY || clientEnv.SYNCD_RELAY_ACCESS_KEY || '';
 
-  if (!relayUrl) throw new Error(`Missing relay URL. Set RELAY_E2E_URL or ${RELAY_AGENT_ENV_PATH}`);
-  if (!relayKey || relayKey.length < 16) throw new Error('Missing or too-short relay agent key');
-  if (!relayAccessKey) throw new Error(`Missing relay access key. Set RELAY_E2E_ACCESS_KEY or ${RELAY_CLIENT_ENV_PATH}`);
+  const missing = [];
+  if (!relayUrl) missing.push(`relay URL (set RELAY_E2E_URL or ${RELAY_AGENT_ENV_PATH})`);
+  if (!relayKey || relayKey.length < 16) missing.push('relay agent key with at least 16 characters');
+  if (!relayAccessKey) missing.push(`relay access key (set RELAY_E2E_ACCESS_KEY or ${RELAY_CLIENT_ENV_PATH})`);
+  if (missing.length > 0) {
+    skipOrThrow(missing.join(', '));
+    return;
+  }
 
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'syncd-relay-e2e-'));
   DATA_DIR = path.join(tempRoot, 'data');

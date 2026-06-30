@@ -176,38 +176,49 @@ def should_retry(response=None, error=None):
     return response.status_code in {429, 500, 502, 503, 504}
 
 
-def request_with_retry(method, path, timeout=15, **kwargs):
+def build_relay_access_headers(method, path, body_bytes):
+    if not CONFIG["relay_access_key"]:
+        return {}
+    timestamp = str(int(time.time() * 1000))
+    nonce = bytes_to_hex(os.urandom(16))
+    body_hash = sha256_hex(body_bytes)
+    signature = do_hmac(
+        CONFIG["relay_access_key"].encode(),
+        "\n".join([method.upper(), path, timestamp, nonce, body_hash]),
+    )
+    return {
+        "X-Relay-Access-Key-Id": "default",
+        "X-Relay-Access-Timestamp": timestamp,
+        "X-Relay-Access-Nonce": nonce,
+        "X-Relay-Access-Signature": signature,
+    }
+
+
+def request_with_retry(method, path, timeout=15, headers_factory=None, **kwargs):
     url = resolve_server_url(path)
     last_error = None
     response = None
-    headers = dict(kwargs.pop("headers", {}) or {})
-    if CONFIG["relay_access_key"]:
-        body_bytes = kwargs.get("data")
-        if body_bytes is None:
-            body_bytes = kwargs.get("body", b"")
-        if isinstance(body_bytes, str):
-            body_bytes = body_bytes.encode()
-        elif body_bytes is None:
-            body_bytes = b""
-        timestamp = str(int(time.time() * 1000))
-        nonce = bytes_to_hex(os.urandom(16))
-        body_hash = sha256_hex(body_bytes)
-        signature = do_hmac(
-            CONFIG["relay_access_key"].encode(),
-            "\n".join([method.upper(), path, timestamp, nonce, body_hash]),
-        )
-        headers["X-Relay-Access-Key-Id"] = "default"
-        headers["X-Relay-Access-Timestamp"] = timestamp
-        headers["X-Relay-Access-Nonce"] = nonce
-        headers["X-Relay-Access-Signature"] = signature
-    if headers:
-        kwargs["headers"] = headers
+    base_headers = dict(kwargs.pop("headers", {}) or {})
+    body_bytes = kwargs.get("data")
+    if body_bytes is None:
+        body_bytes = kwargs.get("body", b"")
+    if isinstance(body_bytes, str):
+        body_bytes = body_bytes.encode()
+    elif body_bytes is None:
+        body_bytes = b""
 
     for attempt in range(CONFIG["retry_attempts"]):
         error = None
         response = None
         try:
-            response = session.request(method, url, timeout=timeout, verify=CONFIG["verify_tls"], **kwargs)
+            headers = dict(base_headers)
+            if headers_factory:
+                headers.update(headers_factory())
+            headers.update(build_relay_access_headers(method, path, body_bytes))
+            attempt_kwargs = dict(kwargs)
+            if headers:
+                attempt_kwargs["headers"] = headers
+            response = session.request(method, url, timeout=timeout, verify=CONFIG["verify_tls"], **attempt_kwargs)
             if not should_retry(response=response):
                 return response
             last_error = RuntimeError(f"{method} {path} -> HTTP {response.status_code}")
@@ -244,8 +255,8 @@ def expect_json(response, path, method):
 
 
 def api_get(path, auth_key=None, device_id=None):
-    headers = build_auth_headers("GET", path, b"", auth_key, device_id) if auth_key else None
-    response = request_with_retry("GET", path, headers=headers)
+    signer = (lambda: build_auth_headers("GET", path, b"", auth_key, device_id)) if auth_key else None
+    response = request_with_retry("GET", path, headers_factory=signer)
     return expect_json(response, path, "GET")
 
 
@@ -254,15 +265,14 @@ def api_post(path, body, auth_key=None, device_id=None):
     headers = {
         "Content-Type": "application/json",
     }
-    if auth_key:
-        headers.update(build_auth_headers("POST", path, body_bytes, auth_key, device_id))
-    response = request_with_retry("POST", path, data=body_bytes, headers=headers)
+    signer = (lambda: build_auth_headers("POST", path, body_bytes, auth_key, device_id)) if auth_key else None
+    response = request_with_retry("POST", path, data=body_bytes, headers=headers, headers_factory=signer)
     return expect_json(response, path, "POST")
 
 
 def api_get_response(path, timeout=60, auth_key=None, device_id=None):
-    headers = build_auth_headers("GET", path, b"", auth_key, device_id) if auth_key else None
-    response = request_with_retry("GET", path, headers=headers, timeout=timeout, stream=True)
+    signer = (lambda: build_auth_headers("GET", path, b"", auth_key, device_id)) if auth_key else None
+    response = request_with_retry("GET", path, timeout=timeout, stream=True, headers_factory=signer)
     if response.status_code == 204:
         return response
     if not response.ok:
@@ -398,11 +408,18 @@ def detect_encryption_format(encrypted_path):
     return "legacy"
 
 
-def decrypt_chunked_aead_file(key_bytes, encrypted_path, output_path):
+def assert_expected_size(actual_size, expected_size):
+    if expected_size and actual_size != expected_size:
+        raise RuntimeError(f"下载大小不匹配：期望 {format_size(expected_size)}，实际 {format_size(actual_size)}")
+
+
+def decrypt_chunked_aead_file(key_bytes, encrypted_path, output_path, expected_size=0):
     HEADER_LEN = 16
     IV_LEN = 12
     LENGTH_LEN = 4
     TAG_LEN = 16
+    FINAL_FRAME_TYPE = 0xFFFFFFFF
+    FINAL_AAD = b"SYNC-FINAL-v1"
 
     with open(encrypted_path, "rb") as source, open(output_path, "wb") as handle:
         header = source.read(HEADER_LEN)
@@ -413,6 +430,9 @@ def decrypt_chunked_aead_file(key_bytes, encrypted_path, output_path):
         if header[4] != 1:
             raise RuntimeError("Unsupported chunked AEAD version")
 
+        chunk_count = 0
+        total_plaintext = 0
+        finalized = False
         while True:
             iv = source.read(IV_LEN)
             if len(iv) == 0:
@@ -424,6 +444,28 @@ def decrypt_chunked_aead_file(key_bytes, encrypted_path, output_path):
             if len(length_bytes) < LENGTH_LEN:
                 raise RuntimeError("Chunked AEAD length truncated")
             ciphertext_len = struct.unpack(">I", length_bytes)[0]
+            if ciphertext_len == FINAL_FRAME_TYPE:
+                final_ciphertext = source.read(12)
+                if len(final_ciphertext) < 12:
+                    raise RuntimeError("Chunked AEAD final frame truncated")
+                final_tag = source.read(TAG_LEN)
+                if len(final_tag) < TAG_LEN:
+                    raise RuntimeError("Chunked AEAD final tag truncated")
+                decryptor = Cipher(
+                    algorithms.AES(key_bytes),
+                    modes.GCM(iv, final_tag),
+                ).decryptor()
+                decryptor.authenticate_additional_data(FINAL_AAD)
+                final_plain = decryptor.update(final_ciphertext) + decryptor.finalize()
+                expected_chunks, expected_chunk_size = struct.unpack(">QI", final_plain)
+                actual_chunk_size = struct.unpack(">I", header[5:9])[0]
+                if expected_chunks != chunk_count or expected_chunk_size != actual_chunk_size:
+                    raise RuntimeError("Chunked AEAD final frame mismatch")
+                trailing = source.read(1)
+                if trailing:
+                    raise RuntimeError("Chunked AEAD trailing data")
+                finalized = True
+                break
 
             ciphertext = source.read(ciphertext_len)
             if len(ciphertext) < ciphertext_len:
@@ -437,11 +479,17 @@ def decrypt_chunked_aead_file(key_bytes, encrypted_path, output_path):
                 algorithms.AES(key_bytes),
                 modes.GCM(iv, tag),
             ).decryptor()
-            handle.write(decryptor.update(ciphertext))
-            handle.write(decryptor.finalize())
+            plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+            handle.write(plaintext)
+            total_plaintext += len(plaintext)
+            chunk_count += 1
+
+        if not finalized:
+            raise RuntimeError("Chunked AEAD final frame missing")
+        assert_expected_size(total_plaintext, expected_size)
 
 
-def decrypt_gcm_file(key_bytes, iv_hex, encrypted_path, output_path):
+def decrypt_gcm_file(key_bytes, iv_hex, encrypted_path, output_path, expected_size=0):
     encrypted_size = os.path.getsize(encrypted_path)
     if encrypted_size < 16:
         raise RuntimeError("批量下载响应过短，无法提取 GCM tag")
@@ -468,16 +516,17 @@ def decrypt_gcm_file(key_bytes, iv_hex, encrypted_path, output_path):
                 handle.write(decryptor.update(chunk))
 
             handle.write(decryptor.finalize())
+    assert_expected_size(os.path.getsize(output_path), expected_size)
 
 
-def decrypt_any_file(key_bytes, encrypted_path, output_path, iv_hex=None):
+def decrypt_any_file(key_bytes, encrypted_path, output_path, iv_hex=None, expected_size=0):
     fmt = detect_encryption_format(encrypted_path)
     if fmt == "chunked-aead-v1":
-        decrypt_chunked_aead_file(key_bytes, encrypted_path, output_path)
+        decrypt_chunked_aead_file(key_bytes, encrypted_path, output_path, expected_size=expected_size)
     else:
         if not iv_hex:
             raise RuntimeError("Legacy 格式需要 IV")
-        decrypt_gcm_file(key_bytes, iv_hex, encrypted_path, output_path)
+        decrypt_gcm_file(key_bytes, iv_hex, encrypted_path, output_path, expected_size=expected_size)
 
 
 def download_cloud_file(key, download_dir, cloud_info, filename):
@@ -495,7 +544,7 @@ def download_cloud_file(key, download_dir, cloud_info, filename):
             safe_name = safe_download_filename(filename)
             output_path = os.path.join(temp_dir, safe_name)
             write_response_to_file(cloud_response, encrypted_path)
-            decrypt_any_file(key, encrypted_path, output_path, iv_hex=cloud_info.get("iv"))
+            decrypt_any_file(key, encrypted_path, output_path, iv_hex=cloud_info.get("iv"), expected_size=cloud_info.get("size", 0) or 0)
             target_path = os.path.join(download_dir, safe_name)
             os.makedirs(download_dir, exist_ok=True)
             os.replace(output_path, target_path)

@@ -5,9 +5,13 @@ const path = require('path');
 const { pipeline } = require('stream/promises');
 const { createDecipheriv } = require('crypto');
 
-require('dotenv').config();
+if (process.env.HYBRID_SMOKE_LOAD_ENV === 'true') {
+  require('dotenv').config();
+}
 
-process.env.STORAGE_PROVIDER = process.env.STORAGE_PROVIDER || 'hybrid';
+const REMOTE_MODE = process.env.HYBRID_SMOKE_REMOTE === 'true';
+
+process.env.STORAGE_PROVIDER = REMOTE_MODE ? 'hybrid' : 'local';
 process.env.STORAGE_DOWNLOAD_MODE = process.env.STORAGE_DOWNLOAD_MODE || 'proxy';
 process.env.STORAGE_FALLBACK_BYTES = process.env.STORAGE_FALLBACK_BYTES || '0';
 process.env.STORAGE_REMOTE_THRESHOLD_BYTES = process.env.STORAGE_REMOTE_THRESHOLD_BYTES || String(128 * 1024);
@@ -28,14 +32,41 @@ async function decryptChunkedAeadFile(key, encryptedPath, outputPath) {
   if (encrypted.length < HEADER_LEN) throw new Error('Chunked AEAD response too short');
   if (encrypted.subarray(0, 4).toString('ascii') !== 'SYNC') throw new Error('Invalid chunked AEAD magic');
   if (encrypted[4] !== 1) throw new Error('Unsupported chunked AEAD version');
+  const chunkSize = encrypted.readUInt32BE(5);
 
   let offset = HEADER_LEN;
   const chunks = [];
+  let chunkCount = 0;
+  let finalized = false;
   while (offset < encrypted.length) {
+    if (offset + IV_LEN + LENGTH_LEN > encrypted.length) throw new Error('Truncated chunk frame header');
     const iv = encrypted.subarray(offset, offset + IV_LEN);
     offset += IV_LEN;
     const len = encrypted.readUInt32BE(offset);
     offset += LENGTH_LEN;
+
+    if (len === 0xffffffff) {
+      if (offset + 12 + TAG_LEN > encrypted.length) throw new Error('Truncated final chunk frame');
+      const ciphertext = encrypted.subarray(offset, offset + 12);
+      offset += 12;
+      const tag = encrypted.subarray(offset, offset + TAG_LEN);
+      offset += TAG_LEN;
+
+      const decipher = createDecipheriv('aes-256-gcm', key, iv);
+      decipher.setAAD(Buffer.from('SYNC-FINAL-v1'));
+      decipher.setAuthTag(tag);
+      const finalPlaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+      const expectedChunks = Number(finalPlaintext.readBigUInt64BE(0));
+      const expectedChunkSize = finalPlaintext.readUInt32BE(8);
+      if (expectedChunks !== chunkCount || expectedChunkSize !== chunkSize) {
+        throw new Error('Invalid chunked AEAD final frame');
+      }
+      finalized = true;
+      if (offset !== encrypted.length) throw new Error('Trailing data after final frame');
+      break;
+    }
+
+    if (offset + len + TAG_LEN > encrypted.length) throw new Error('Truncated chunk frame body');
     const ciphertext = encrypted.subarray(offset, offset + len);
     offset += len;
     const tag = encrypted.subarray(offset, offset + TAG_LEN);
@@ -44,7 +75,9 @@ async function decryptChunkedAeadFile(key, encryptedPath, outputPath) {
     const decipher = createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAuthTag(tag);
     chunks.push(Buffer.concat([decipher.update(ciphertext), decipher.final()]));
+    chunkCount++;
   }
+  if (!finalized) throw new Error('Missing chunked AEAD final frame');
 
   fs.writeFileSync(outputPath, Buffer.concat(chunks));
 }
@@ -91,12 +124,13 @@ async function main() {
   const smallPath = path.join(sharedDir, 'small.txt');
   const largePath = path.join(sharedDir, 'large.bin');
   fs.writeFileSync(smallPath, Buffer.from('small hybrid smoke ' + Date.now()));
-  fs.writeFileSync(largePath, crypto.randomBytes(256 * 1024));
+    fs.writeFileSync(largePath, crypto.randomBytes(256 * 1024));
 
   try {
     const small = await roundtrip(dataDir, masterKey, 'small.txt', smallPath, 'local');
     console.log(`small_backend=${small.backend}`);
-    const large = await roundtrip(dataDir, masterKey, 'large.bin', largePath, 'remote');
+    const largeExpectedBackend = REMOTE_MODE ? 'remote' : 'local';
+    const large = await roundtrip(dataDir, masterKey, 'large.bin', largePath, largeExpectedBackend);
     console.log(`large_backend=${large.backend}`);
 
     await storage.deleteCloudObjectForPath(dataDir, 'small.txt');

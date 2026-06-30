@@ -117,6 +117,16 @@ const PROTECTED_SHARED_RELATIVE_PATHS = new Set(
 
 // ============ Persistent State ============
 
+function ensurePrivateDataDir() {
+  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(DATA_DIR, 0o700); } catch {}
+}
+
+function writePrivateJson(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), { mode: 0o600 });
+  try { fs.chmodSync(file, 0o600); } catch {}
+}
+
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
@@ -127,8 +137,8 @@ function loadState() {
 }
 
 function saveState(data) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2));
+  ensurePrivateDataDir();
+  writePrivateJson(STATE_FILE, data);
 }
 
 function logEvent(event, fields = {}) {
@@ -253,10 +263,25 @@ function persistDevices() {
 // Admin token: random per-run, written to file for CLI access
 const ADMIN_TOKEN_FILE = path.join(DATA_DIR, '.admin-token');
 const adminToken = crypto.randomBytes(16).toString('hex');
-fs.mkdirSync(DATA_DIR, { recursive: true });
+ensurePrivateDataDir();
 fs.writeFileSync(ADMIN_TOKEN_FILE, adminToken, { mode: 0o600 });
+try { fs.chmodSync(ADMIN_TOKEN_FILE, 0o600); } catch {}
+
+function isLoopbackAddress(address) {
+  const normalized = String(address || '')
+    .replace(/^::ffff:/, '')
+    .toLowerCase();
+  return normalized === '::1' || normalized === 'localhost' || normalized.startsWith('127.');
+}
+
+function isLoopbackRequest(req) {
+  return isLoopbackAddress(req.socket?.remoteAddress || req.ip);
+}
 
 function requireAdmin(req, res, next) {
+  if (!isLoopbackRequest(req)) {
+    return res.status(403).json({ error: 'Local admin API only accepts loopback requests' });
+  }
   const token = req.headers['x-admin-token'];
   if (token !== adminToken) {
     return res.status(403).json({ error: 'Forbidden' });
@@ -1324,7 +1349,9 @@ app.get('/api/cloud/status', requireDeviceAuth, async (req, res) => {
         try {
           const cdnStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
           const cdnEnd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-          const cdnBody = JSON.stringify({ startDate: cdnStart, endDate: cdnEnd, granularity: 'day', domains: 'tgazj2p2k.hd-bkt.clouddn.com' });
+          const cdnDomain = String(config.cdnBucket || process.env.QINIU_CDN_DOMAIN || '').trim();
+          if (!cdnDomain) throw new Error('Qiniu CDN domain is not configured');
+          const cdnBody = JSON.stringify({ startDate: cdnStart, endDate: cdnEnd, granularity: 'day', domains: cdnDomain });
           const cdnPath = '/v2/tune/flux';
           const cdnUrl = `https://fusion.qiniuapi.com${cdnPath}`;
           const cdnToken = qiniu.util.generateAccessToken(mac, cdnUrl);
@@ -1342,7 +1369,7 @@ app.get('/api/cloud/status', requireDeviceAuth, async (req, res) => {
           });
 
           if (cdnRes.code === 200 && cdnRes.data) {
-            const domain = cdnRes.data['tgazj2p2k.hd-bkt.clouddn.com'];
+            const domain = cdnRes.data[cdnDomain];
             if (domain && domain.china) {
               for (const val of domain.china) { cdnTrafficUsed += val || 0; }
             }
@@ -1406,8 +1433,8 @@ function loadSettings() {
 }
 
 function saveSettings(data) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2));
+  ensurePrivateDataDir();
+  writePrivateJson(SETTINGS_FILE, data);
 }
 
 app.get('/api/settings', requireDeviceAuth, (req, res) => {
@@ -1440,18 +1467,12 @@ function loadShareTokens() {
 }
 
 function saveShareTokens(data) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(SHARE_TOKEN_FILE, JSON.stringify(data, null, 2));
+  ensurePrivateDataDir();
+  writePrivateJson(SHARE_TOKEN_FILE, data);
 }
 
 function generateShareToken() {
-  const chars = '23456789abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ';
-  const bytes = crypto.randomBytes(8);
-  let token = '';
-  for (let i = 0; i < 8; i++) {
-    token += chars[bytes[i] % chars.length];
-  }
-  return token;
+  return crypto.randomBytes(16).toString('base64url');
 }
 
 // Create share link (requires device auth)
@@ -1601,16 +1622,6 @@ function startSharedDirWatcher() {
       pendingUploads.set(relPath, setTimeout(() => {
         pendingUploads.delete(relPath);
         if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) return;
-
-        const index = storage.loadIndex(DATA_DIR);
-        const existing = index.files[relPath];
-        if (existing) {
-          const stat = fs.statSync(fullPath);
-          const existingSize = existing.size || 0;
-          if (existingSize === stat.size) {
-            return;
-          }
-        }
 
         console.log(`[Watcher] Auto-uploading: ${relPath}`);
         storage.uploadFileToCloud(DATA_DIR, masterKey, relPath, fullPath)

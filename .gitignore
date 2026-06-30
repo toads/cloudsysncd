@@ -15,9 +15,16 @@ shared/*
 !shared/sync_download.py
 
 # === Secrets & Config ===
-.env
-.env_*
+.env*
+!.env.example
+.envrc
+.npmrc
+.pypirc
 .relay*.env
+*.pem
+*.key
+*.p12
+*.pfx
 
 # === Logs & Output ===
 logs/

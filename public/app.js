@@ -303,6 +303,8 @@ class ChunkedAeadParser {
     this.ciphertextLength = null;
     this.ciphertext = null;
     this.cachedKey = null;
+    this.chunkCount = 0;
+    this.finalized = false;
   }
 
   push(data) {
@@ -344,6 +346,11 @@ class ChunkedAeadParser {
         if (this.buffer.length < 4) return;
         const lenBytes = this.consume(4);
         this.ciphertextLength = (lenBytes[0] << 24) | (lenBytes[1] << 16) | (lenBytes[2] << 8) | lenBytes[3];
+        if (this.ciphertextLength === 0xffffffff) {
+          this.ciphertextLength = 12;
+          this.state = 'finalCiphertext';
+          continue;
+        }
         this.state = 'ciphertext';
       } else if (this.state === 'ciphertext') {
         if (this.buffer.length < this.ciphertextLength) return;
@@ -358,10 +365,43 @@ class ChunkedAeadParser {
         combined.set(tag, this.ciphertext.length);
         const plaintext = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv: this.iv }, key, combined);
         controller.enqueue(new Uint8Array(plaintext));
+        this.chunkCount++;
         this.iv = null;
         this.ciphertext = null;
         this.ciphertextLength = null;
         this.state = 'iv';
+      } else if (this.state === 'finalCiphertext') {
+        if (this.buffer.length < this.ciphertextLength) return;
+        this.ciphertext = this.consume(this.ciphertextLength);
+        this.state = 'finalTag';
+      } else if (this.state === 'finalTag') {
+        if (this.buffer.length < 16) return;
+        const tag = this.consume(16);
+        const key = await this.importKey();
+        const combined = new Uint8Array(this.ciphertext.length + tag.length);
+        combined.set(this.ciphertext);
+        combined.set(tag, this.ciphertext.length);
+        const plaintext = await window.crypto.subtle.decrypt({
+          name: 'AES-GCM',
+          iv: this.iv,
+          additionalData: new TextEncoder().encode('SYNC-FINAL-v1'),
+        }, key, combined);
+        const view = new DataView(plaintext);
+        const expectedChunks = Number(view.getBigUint64(0, false));
+        const expectedChunkSize = view.getUint32(8, false);
+        if (expectedChunks !== this.chunkCount || expectedChunkSize !== this.chunkSize) {
+          throw new Error('Invalid chunked AEAD final frame');
+        }
+        this.iv = null;
+        this.ciphertext = null;
+        this.ciphertextLength = null;
+        this.finalized = true;
+        this.state = 'done';
+      } else if (this.state === 'done') {
+        if (this.buffer.length > 0) {
+          throw new Error('Trailing data after chunked AEAD final frame');
+        }
+        return;
       }
     }
   }
@@ -375,7 +415,7 @@ function createChunkedAeadDecryptStream(keyBytes) {
       await parser.process(controller);
     },
     flush(controller) {
-      if (parser.state !== 'iv' || parser.buffer.length > 0) {
+      if (!parser.finalized || parser.state !== 'done' || parser.buffer.length > 0) {
         controller.error(new Error('Incomplete chunked AEAD stream'));
       }
     },
@@ -400,11 +440,11 @@ async function openDownloadDB() {
   });
 }
 
-async function clearDownloadStore(db, keyPrefix) {
+async function clearDownloadStore(db, downloadId) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(DOWNLOAD_STORE, 'readwrite');
     const store = tx.objectStore(DOWNLOAD_STORE);
-    const range = IDBKeyRange.bound(keyPrefix + '\x00', keyPrefix + '\xFF');
+    const range = IDBKeyRange.bound([downloadId, 0], [downloadId, Number.MAX_SAFE_INTEGER]);
     const req = store.openCursor(range);
     req.onsuccess = (e) => {
       const cursor = e.target.result;
@@ -418,27 +458,34 @@ async function clearDownloadStore(db, keyPrefix) {
   });
 }
 
-async function writeDownloadChunk(db, key, chunk) {
+async function writeDownloadChunk(db, downloadId, chunkIndex, chunk) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(DOWNLOAD_STORE, 'readwrite');
     const store = tx.objectStore(DOWNLOAD_STORE);
-    store.put(chunk, key);
+    store.put(chunk, [downloadId, chunkIndex]);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
 }
 
-async function readDownloadChunks(db, keyPrefix) {
+async function readDownloadChunks(db, downloadId) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(DOWNLOAD_STORE, 'readonly');
     const store = tx.objectStore(DOWNLOAD_STORE);
-    const range = IDBKeyRange.bound(keyPrefix + '\x00', keyPrefix + '\xFF');
+    const range = IDBKeyRange.bound([downloadId, 0], [downloadId, Number.MAX_SAFE_INTEGER]);
     const chunks = [];
+    let expectedIndex = 0;
     const req = store.openCursor(range);
     req.onsuccess = (e) => {
       const cursor = e.target.result;
       if (cursor) {
+        const index = Array.isArray(cursor.key) ? cursor.key[1] : expectedIndex;
+        if (index !== expectedIndex) {
+          reject(new Error('Downloaded chunks are incomplete'));
+          return;
+        }
         chunks.push(cursor.value);
+        expectedIndex++;
         cursor.continue();
       } else {
         resolve(chunks);
@@ -448,30 +495,28 @@ async function readDownloadChunks(db, keyPrefix) {
   });
 }
 
-async function streamDownloadToFile(stream, filename, onProgress) {
-  let reader = stream.getReader();
-
-  try {
-    return await downloadViaIndexedDB(reader, filename, onProgress);
-  } catch (indexedDbErr) {
-    console.warn('[Download] IndexedDB failed, trying File System Access API:', indexedDbErr.message);
-
-    if (window.showSaveFilePicker) {
-      try {
-        return await downloadViaFileSystemAPI(reader, filename, onProgress);
-      } catch (fsErr) {
-        if (fsErr.name === 'AbortError') return { cancelled: true };
-        console.warn('[Download] File System Access API failed, falling back to memory:', fsErr.message);
-      }
-    }
-
-    return await downloadViaMemory(reader, filename, onProgress);
+function assertExpectedDownloadBytes(actual, expected) {
+  if (Number.isFinite(expected) && expected > 0 && actual !== expected) {
+    throw new Error(`下载大小不匹配：期望 ${formatBytes(expected)}，实际 ${formatBytes(actual)}`);
   }
 }
 
-async function downloadViaIndexedDB(reader, filename, onProgress) {
+async function streamDownloadToFile(stream, filename, onProgress, { expectedBytes = 0 } = {}) {
+  if (window.showSaveFilePicker) {
+    try {
+      return await downloadViaFileSystemAPI(stream.getReader(), filename, onProgress, expectedBytes);
+    } catch (fsErr) {
+      if (fsErr.name === 'AbortError') return { cancelled: true };
+      throw fsErr;
+    }
+  }
+
+  return downloadViaIndexedDB(stream.getReader(), filename, onProgress, expectedBytes);
+}
+
+async function downloadViaIndexedDB(reader, filename, onProgress, expectedBytes = 0) {
   const db = await openDownloadDB();
-  const keyPrefix = 'dl:' + Date.now() + ':';
+  const downloadId = `dl:${Date.now()}:${window.crypto.randomUUID()}`;
   let chunkIndex = 0;
   let total = 0;
 
@@ -480,7 +525,7 @@ async function downloadViaIndexedDB(reader, filename, onProgress) {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        await writeDownloadChunk(db, keyPrefix + chunkIndex, value);
+        await writeDownloadChunk(db, downloadId, chunkIndex, value);
         chunkIndex++;
         total += value.length;
         if (onProgress) onProgress(total);
@@ -489,20 +534,22 @@ async function downloadViaIndexedDB(reader, filename, onProgress) {
       reader.releaseLock();
     }
 
-    const chunks = await readDownloadChunks(db, keyPrefix);
+    assertExpectedDownloadBytes(total, expectedBytes);
+    const chunks = await readDownloadChunks(db, downloadId);
     const blob = new Blob(chunks);
     downloadBlob(filename, blob);
     return { saved: true, bytes: total };
   } finally {
-    await clearDownloadStore(db, keyPrefix);
+    await clearDownloadStore(db, downloadId);
     db.close();
   }
 }
 
-async function downloadViaFileSystemAPI(reader, filename, onProgress) {
+async function downloadViaFileSystemAPI(reader, filename, onProgress, expectedBytes = 0) {
   const handle = await window.showSaveFilePicker({ suggestedName: filename });
   const writable = await handle.createWritable();
   let received = 0;
+  let completed = false;
 
   try {
     while (true) {
@@ -512,15 +559,20 @@ async function downloadViaFileSystemAPI(reader, filename, onProgress) {
       received += value.length;
       if (onProgress) onProgress(received);
     }
+    assertExpectedDownloadBytes(received, expectedBytes);
+    completed = true;
+  } catch (err) {
+    try { await writable.abort(); } catch {}
+    throw err;
   } finally {
     reader.releaseLock();
-    await writable.close();
+    if (completed) await writable.close();
   }
 
   return { saved: true, bytes: received };
 }
 
-async function downloadViaMemory(reader, filename, onProgress) {
+async function downloadViaMemory(reader, filename, onProgress, expectedBytes = 0) {
   const chunks = [];
   let total = 0;
 
@@ -539,6 +591,7 @@ async function downloadViaMemory(reader, filename, onProgress) {
     reader.releaseLock();
   }
 
+  assertExpectedDownloadBytes(total, expectedBytes);
   const blob = new Blob(chunks);
   downloadBlob(filename, blob);
   return { saved: true, bytes: total };
@@ -549,8 +602,13 @@ function downloadBlob(filename, blob) {
   const anchor = document.createElement('a');
   anchor.href = url;
   anchor.download = filename;
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
   anchor.click();
-  URL.revokeObjectURL(url);
+  setTimeout(() => {
+    URL.revokeObjectURL(url);
+    anchor.remove();
+  }, 30000);
 }
 
 // ============ Networking ============
@@ -668,6 +726,10 @@ function getRelayBaseUrls() {
     preferred = '';
   }
   if (!preferred || !urls.includes(preferred)) return urls;
+  if (!isRelayBaseUrlUsableInBrowser(preferred)) {
+    try { localStorage.removeItem(PREFERRED_RELAY_BASE_URL_KEY); } catch {}
+    return urls;
+  }
   return [preferred];
 }
 
@@ -1833,7 +1895,8 @@ async function downloadFile(name, element) {
               ? `${Math.min(100, (received / progressTotal) * 100).toFixed(0)}%`
               : `已下载 ${formatBytes(received)}`,
           });
-        }
+        },
+        { expectedBytes: progressTotal }
       );
       if (saved) {
         if (progressTotal > 0) {
@@ -1886,7 +1949,7 @@ async function downloadArchive(paths, fallbackName, { onProgress } = {}) {
   const result = await decryptDownloadResponse(response, { onProgress });
   const filename = result.filename || fallbackName;
   if (result.isStream) {
-    await streamDownloadToFile(result.stream, filename, onProgress);
+    await streamDownloadToFile(result.stream, filename, onProgress, { expectedBytes: Number(result.totalSize || 0) });
   } else {
     downloadBuffer(filename, result.plainBuf);
   }

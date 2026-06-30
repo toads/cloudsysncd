@@ -11,6 +11,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY public ./public
+COPY lib ./lib
+COPY relay ./relay
 COPY server.js pin.js share.js start.sh LICENSE README.md OPEN_SOURCE_AUDIT.md ROADMAP.md ./
 COPY shared/sync_download.py ./shared/sync_download.py
 

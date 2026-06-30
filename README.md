@@ -240,8 +240,8 @@ QINIU_BUCKET=<...>
 ```bash
 STORAGE_FALLBACK_BYTES=1048576        # 超过此字节数才使用云端，默认 1MB
 STORAGE_PRESIGN_EXPIRY_SECONDS=3600   # Presigned URL 有效期，默认 1 小时
-STORAGE_HOT_DURATION_MS=43200000      # 冷热数据：12 小时未访问自动删除
-STORAGE_MAX_BYTES=4294967296          # 云存储上限：4GB
+STORAGE_HOT_DURATION_MS=259200000     # 冷热数据：72 小时未访问自动删除
+STORAGE_MAX_BYTES=5368709120          # 云存储上限：5GB
 ```
 
 说明：

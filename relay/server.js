@@ -356,6 +356,7 @@ function sanitizeHeaders(headers, { keepContentLength = false } = {}) {
     if (hopByHopHeaders.has(lower)) continue;
     if (!keepContentLength && lower === 'content-length') continue;
     if (lower === 'authorization' && value === `Bearer ${RELAY_KEY}`) continue;
+    if (lower === 'x-admin-token') continue;
     if (lower === 'x-relay-access-key') continue;
     if (lower.startsWith('x-relay-access-')) continue;
     if (lower === 'cookie') {
@@ -586,7 +587,7 @@ app.all(/.*/, (req, res) => {
     return res.status(accessFailure.status || 401).json({ error: accessFailure.message || 'Missing or invalid relay access key' });
   }
 
-  if (req.path.startsWith('/api/local/')) {
+  if (String(req.path || '').toLowerCase().startsWith('/api/local/')) {
     return res.status(403).json({ error: 'Local admin API is not exposed through relay' });
   }
 
