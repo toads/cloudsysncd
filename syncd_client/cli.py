@@ -8,6 +8,7 @@ import argparse
 import io
 import json
 import os
+import struct
 import sys
 import time
 import hmac
@@ -47,6 +48,7 @@ session.headers.update({
 CONFIG = {
     "server": DEFAULT_SERVER.rstrip("/"),
     "verify_tls": False,
+    "relay_access_key": os.environ.get("SYNCD_RELAY_ACCESS_KEY", ""),
     "retry_base": 2.0,
     "retry_max": 20.0,
     "retry_attempts": 4,
@@ -178,6 +180,28 @@ def request_with_retry(method, path, timeout=15, **kwargs):
     url = resolve_server_url(path)
     last_error = None
     response = None
+    headers = dict(kwargs.pop("headers", {}) or {})
+    if CONFIG["relay_access_key"]:
+        body_bytes = kwargs.get("data")
+        if body_bytes is None:
+            body_bytes = kwargs.get("body", b"")
+        if isinstance(body_bytes, str):
+            body_bytes = body_bytes.encode()
+        elif body_bytes is None:
+            body_bytes = b""
+        timestamp = str(int(time.time() * 1000))
+        nonce = bytes_to_hex(os.urandom(16))
+        body_hash = sha256_hex(body_bytes)
+        signature = do_hmac(
+            CONFIG["relay_access_key"].encode(),
+            "\n".join([method.upper(), path, timestamp, nonce, body_hash]),
+        )
+        headers["X-Relay-Access-Key-Id"] = "default"
+        headers["X-Relay-Access-Timestamp"] = timestamp
+        headers["X-Relay-Access-Nonce"] = nonce
+        headers["X-Relay-Access-Signature"] = signature
+    if headers:
+        kwargs["headers"] = headers
 
     for attempt in range(CONFIG["retry_attempts"]):
         error = None
@@ -344,10 +368,19 @@ def get_key(state_dir, state, state_path, device_name):
 def safe_extract_tar(tar_file, download_dir):
     root = os.path.realpath(download_dir)
     for member in tar_file.getmembers():
+        if member.issym() or member.islnk():
+            raise RuntimeError(f"归档包含链接文件: {member.name}")
         member_path = os.path.realpath(os.path.join(download_dir, member.name))
         if member_path != root and not member_path.startswith(root + os.sep):
             raise RuntimeError(f"归档包含非法路径: {member.name}")
     tar_file.extractall(path=download_dir)
+
+
+def safe_download_filename(filename, fallback="download"):
+    base = os.path.basename(str(filename or fallback))
+    if base in {"", ".", ".."}:
+        return fallback
+    return base
 
 
 def write_response_to_file(response, target_path):
@@ -355,6 +388,57 @@ def write_response_to_file(response, target_path):
         for chunk in response.iter_content(chunk_size=1024 * 1024):
             if chunk:
                 handle.write(chunk)
+
+
+def detect_encryption_format(encrypted_path):
+    with open(encrypted_path, "rb") as handle:
+        header = handle.read(4)
+    if header == b"SYNC":
+        return "chunked-aead-v1"
+    return "legacy"
+
+
+def decrypt_chunked_aead_file(key_bytes, encrypted_path, output_path):
+    HEADER_LEN = 16
+    IV_LEN = 12
+    LENGTH_LEN = 4
+    TAG_LEN = 16
+
+    with open(encrypted_path, "rb") as source, open(output_path, "wb") as handle:
+        header = source.read(HEADER_LEN)
+        if len(header) < HEADER_LEN:
+            raise RuntimeError("Chunked AEAD 响应过短")
+        if header[:4] != b"SYNC":
+            raise RuntimeError("Invalid chunked AEAD magic")
+        if header[4] != 1:
+            raise RuntimeError("Unsupported chunked AEAD version")
+
+        while True:
+            iv = source.read(IV_LEN)
+            if len(iv) == 0:
+                break
+            if len(iv) < IV_LEN:
+                raise RuntimeError("Chunked AEAD IV truncated")
+
+            length_bytes = source.read(LENGTH_LEN)
+            if len(length_bytes) < LENGTH_LEN:
+                raise RuntimeError("Chunked AEAD length truncated")
+            ciphertext_len = struct.unpack(">I", length_bytes)[0]
+
+            ciphertext = source.read(ciphertext_len)
+            if len(ciphertext) < ciphertext_len:
+                raise RuntimeError("Chunked AEAD ciphertext truncated")
+
+            tag = source.read(TAG_LEN)
+            if len(tag) < TAG_LEN:
+                raise RuntimeError("Chunked AEAD tag truncated")
+
+            decryptor = Cipher(
+                algorithms.AES(key_bytes),
+                modes.GCM(iv, tag),
+            ).decryptor()
+            handle.write(decryptor.update(ciphertext))
+            handle.write(decryptor.finalize())
 
 
 def decrypt_gcm_file(key_bytes, iv_hex, encrypted_path, output_path):
@@ -386,6 +470,41 @@ def decrypt_gcm_file(key_bytes, iv_hex, encrypted_path, output_path):
             handle.write(decryptor.finalize())
 
 
+def decrypt_any_file(key_bytes, encrypted_path, output_path, iv_hex=None):
+    fmt = detect_encryption_format(encrypted_path)
+    if fmt == "chunked-aead-v1":
+        decrypt_chunked_aead_file(key_bytes, encrypted_path, output_path)
+    else:
+        if not iv_hex:
+            raise RuntimeError("Legacy 格式需要 IV")
+        decrypt_gcm_file(key_bytes, iv_hex, encrypted_path, output_path)
+
+
+def download_cloud_file(key, download_dir, cloud_info, filename):
+    url = cloud_info.get("url")
+    if not url:
+        raise RuntimeError("Cloud 响应缺少 URL")
+
+    cloud_response = session.get(url, timeout=300, stream=True, verify=CONFIG["verify_tls"])
+    try:
+        if not cloud_response.ok:
+            raise RuntimeError(f"Cloud 下载失败: HTTP {cloud_response.status_code}")
+
+        with tempfile.TemporaryDirectory(prefix="cloudsysncd-cloud-") as temp_dir:
+            encrypted_path = os.path.join(temp_dir, "cloud.enc")
+            safe_name = safe_download_filename(filename)
+            output_path = os.path.join(temp_dir, safe_name)
+            write_response_to_file(cloud_response, encrypted_path)
+            decrypt_any_file(key, encrypted_path, output_path, iv_hex=cloud_info.get("iv"))
+            target_path = os.path.join(download_dir, safe_name)
+            os.makedirs(download_dir, exist_ok=True)
+            os.replace(output_path, target_path)
+
+        return 1, cloud_info.get("size", 0)
+    finally:
+        cloud_response.close()
+
+
 def batch_download(key, download_dir, device_id, since=None):
     path = "/api/batch"
     if since is not None:
@@ -406,7 +525,7 @@ def batch_download(key, download_dir, device_id, since=None):
                 encrypted_path = os.path.join(temp_dir, "batch.enc")
                 archive_path = os.path.join(temp_dir, "batch.tar.gz")
                 write_response_to_file(response, encrypted_path)
-                decrypt_gcm_file(key, iv_hex, encrypted_path, archive_path)
+                decrypt_any_file(key, encrypted_path, archive_path, iv_hex=iv_hex)
 
                 with tarfile.open(archive_path, mode="r:gz") as tar_handle:
                     safe_extract_tar(tar_handle, download_dir)
@@ -414,6 +533,11 @@ def batch_download(key, download_dir, device_id, since=None):
             return count, total_size, snapshot_at
 
         data = response.json()
+        cloud_info = data.get("cloud") or data.get("r2")
+        if cloud_info and cloud_info.get("url"):
+            count, total_size = download_cloud_file(key, download_dir, cloud_info, data.get("filename", "download"))
+            return count, total_size, snapshot_at
+
         count = data.get("count", 0)
         total_size = data.get("totalSize", 0)
         if count == 0 or data.get("encrypted") is None:
@@ -447,6 +571,7 @@ def main():
     parser.add_argument("--state-dir", default=None, help="状态目录，默认与下载目录相同")
     parser.add_argument("--once", action="store_true", help="只执行一次")
     parser.add_argument("--device-name", default=None, help="配对时写入的设备名称")
+    parser.add_argument("--relay-access-key", default=os.environ.get("SYNCD_RELAY_ACCESS_KEY", ""), help="TX relay 公网入口访问 key")
     parser.add_argument("--retry-base", type=float, default=2.0, help="失败后重试的基础等待秒数")
     parser.add_argument("--retry-max", type=float, default=20.0, help="失败后重试的最大等待秒数")
     tls_group = parser.add_mutually_exclusive_group()
@@ -457,6 +582,7 @@ def main():
     server = DEFAULT_SERVER.rstrip("/")
     CONFIG["server"] = server
     CONFIG["verify_tls"] = should_verify_tls(server, args.verify_tls, args.insecure)
+    CONFIG["relay_access_key"] = args.relay_access_key.strip()
     CONFIG["retry_base"] = max(args.retry_base, 0.1)
     CONFIG["retry_max"] = max(args.retry_max, CONFIG["retry_base"])
     if not CONFIG["verify_tls"]:
@@ -479,6 +605,7 @@ def main():
     log(f"  状态目录: {state_dir}")
     log(f"  设备名称: {device_name}")
     log(f"  TLS 校验: {'开启' if CONFIG['verify_tls'] else '关闭'}")
+    log(f"  Relay 入口鉴权: {'已配置' if CONFIG['relay_access_key'] else '未配置'}")
     log(f"  轮询间隔: {args.interval}s")
     log("")
 

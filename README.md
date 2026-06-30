@@ -76,6 +76,24 @@ npm run smoke
 
 这个命令会使用临时目录和临时端口启动服务，并检查 `GET /healthz` 是否正常返回。
 
+其他可用测试命令：
+
+```bash
+npm run test             # smoke + integration
+npm run test:chunked     # 验证 5MB chunked AEAD 下载/解密
+npm run test:cloud       # 验证真实云存储上传 + Presigned URL 下载（需要配置 .env）
+npm run test:e2e         # 50MB 端到端：Node server + Python CLI + chunked AEAD
+npm run test:e2e-qiniu   # 5MB Qiniu 端到端测试（需要 Qiniu 凭证）
+npm run qiniu:usage      # 查看 Qiniu 存储用量统计
+npm run qiniu:objects    # 列出 Qiniu bucket 中的对象
+```
+
+运行 `test:e2e` 前确保 Python 依赖已安装：
+
+```bash
+pip install requests cryptography
+```
+
 ## Docker 快速启动
 
 如果你更希望直接通过容器运行：
@@ -194,6 +212,45 @@ cloudsysncd-sync --device-name "NAS Puller" --state-dir ./sync-state --verify-tl
 - `SYNCD_SERVER`: Python 客户端访问的服务端地址
 - `SYNCD_VERIFY_TLS`: Python 客户端是否校验证书，可选值 `true/false`
 
+### 可选：云存储大文件加速
+
+支持 Cloudflare R2（全球）和七牛云 Qiniu（中国）。设置后，服务端会在 `share.js` 复制文件时自动加密上传到云端，并在客户端请求大文件时返回 Presigned URL，避免服务器出口带宽瓶颈。
+
+复制 `.env.example` 为 `.env` 并填写：
+
+**Cloudflare R2：**
+```bash
+STORAGE_PROVIDER=r2
+R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+R2_ACCESS_KEY_ID=<...>
+R2_SECRET_ACCESS_KEY=<...>
+R2_BUCKET=<...>
+```
+
+**七牛云 Qiniu：**
+```bash
+STORAGE_PROVIDER=qiniu
+QINIU_ACCESS_KEY=<...>
+QINIU_SECRET_KEY=<...>
+QINIU_BUCKET=<...>
+# 可选：QINIU_ENDPOINT=https://s3-cn-east-1.qiniucs.com
+```
+
+**通用配置：**
+```bash
+STORAGE_FALLBACK_BYTES=1048576        # 超过此字节数才使用云端，默认 1MB
+STORAGE_PRESIGN_EXPIRY_SECONDS=3600   # Presigned URL 有效期，默认 1 小时
+STORAGE_HOT_DURATION_MS=43200000      # 冷热数据：12 小时未访问自动删除
+STORAGE_MAX_BYTES=4294967296          # 云存储上限：4GB
+```
+
+说明：
+
+- 只有超过 `STORAGE_FALLBACK_BYTES` 的文件才会走云端；小文件仍由服务端直接流式传输。
+- 上传的对象内容是 chunked AEAD 密文，云服务商无法读取明文。
+- 浏览器现在支持流式解密大文件（通过 File System Access API 直接保存到磁盘）。
+- 服务端启动时会自动清理：孤立对象、超过 `STORAGE_HOT_DURATION_MS` 的冷数据、超过 `STORAGE_MAX_BYTES` 上限的旧数据。
+
 如果你要使用自定义 Cloudflare 域名或 `trycloudflare`，还需要先在本机安装 `cloudflared`。
 
 ## 健康检查
@@ -269,7 +326,8 @@ git ls-files
 - 当前服务端已增加逐请求 HMAC 验签和设备撤销，但还没有密钥轮换流程
 - 浏览器端会把主密钥保存在 IndexedDB
 - Python 客户端会把主密钥保存在下载目录
-- 客户端解密阶段仍需要在本地持有完整响应内容
-- 浏览器端的大归档下载仍会先完整接收密文再在本地解密，更适合中小规模使用
+- 小文件（≤64MB）仍使用一次性 AES-GCM，大文件使用 chunked AEAD 流式加密
+- 浏览器下载超大文件需要支持 File System Access API（Chrome 86+、Edge 86+、Safari 待完善）
+- 浏览器端的大归档下载若不支持 File System Access API，仍会先完整接收密文再在本地解密
 
 这些问题的详细说明见 [OPEN_SOURCE_AUDIT.md](./OPEN_SOURCE_AUDIT.md)。

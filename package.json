@@ -8,14 +8,30 @@
     "dev": "./start.sh --dev",
     "smoke": "node scripts/smoke-test.js",
     "integration": "node scripts/integration-test.js",
-    "test": "npm run smoke && npm run integration"
+    "test": "npm run smoke && npm run integration",
+    "test:chunked": "node scripts/chunked-test.js",
+    "test:cloud": "node scripts/cloud-smoke.js",
+    "test:hybrid": "node scripts/hybrid-smoke.js",
+    "test:e2e": "node scripts/e2e-50mb.js",
+    "test:e2e-relay-tx": "node scripts/e2e-relay-tx.js",
+    "test:e2e-qiniu": "node scripts/e2e-qiniu.js",
+    "test:security-relay": "node scripts/security-relay-test.js",
+    "relay:server": "node relay/server.js",
+    "relay:agent": "node relay/agent.js",
+    "qiniu:usage": "node scripts/qiniu-usage.js",
+    "qiniu:objects": "node scripts/qiniu-objects.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1063.0",
+    "@aws-sdk/lib-storage": "^3.1063.0",
+    "@aws-sdk/s3-request-presigner": "^3.1063.0",
+    "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "qiniu": "^7.15.2",
     "tar": "^7.5.11"
   },
   "devDependencies": {

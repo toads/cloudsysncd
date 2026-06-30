@@ -17,8 +17,82 @@ function resolveSharedDir() {
   return localDir;
 }
 
+function resolveDataDir() {
+  if (process.env.DATA_DIR) {
+    return path.resolve(process.env.DATA_DIR);
+  }
+
+  const localDir = path.join(__dirname, 'data');
+  const dockerDir = path.join(__dirname, '.local', 'data');
+  const dockerToken = path.join(__dirname, '.local', 'data', '.admin-token');
+
+  if (fs.existsSync(dockerToken)) {
+    return dockerDir;
+  }
+  return localDir;
+}
+
 const sharedDir = resolveSharedDir();
+const dataDir = resolveDataDir();
 const repoSharedSourceDir = path.resolve(path.join(__dirname, 'shared'));
+
+const storage = require('./lib/cloud-storage');
+
+function loadMasterKey() {
+  try {
+    const stateFile = path.join(dataDir, 'state.json');
+    if (!fs.existsSync(stateFile)) return null;
+    const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    if (state && typeof state.masterKey === 'string' && state.masterKey) {
+      return Buffer.from(state.masterKey, 'hex');
+    }
+  } catch {
+    return null;
+  }
+}
+
+function walkSharedFiles(dir, prefix = '') {
+  const results = [];
+  if (!fs.existsSync(dir)) return results;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith('.')) continue;
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (isHiddenSharedRelPath(rel)) continue;
+    const full = path.join(dir, entry.name);
+    let stat;
+    try {
+      stat = fs.lstatSync(full);
+    } catch {
+      continue;
+    }
+    if (stat.isSymbolicLink()) {
+      console.warn(`  跳过符号链接: ${rel}`);
+      continue;
+    }
+    if (entry.isDirectory()) {
+      results.push(...walkSharedFiles(full, rel));
+    } else {
+      results.push({ rel, full });
+    }
+  }
+  return results;
+}
+
+function scheduleCloudUpload(relPath, fullPath) {
+  const masterKey = loadMasterKey();
+  if (!masterKey) return;
+  if (!storage.isStorageEnabled()) return;
+  storage.uploadFileToCloud(dataDir, masterKey, relPath, fullPath).catch(() => {});
+}
+
+function scheduleCloudClear() {
+  if (!storage.isStorageEnabled()) return;
+  const index = storage.loadIndex ? storage.loadIndex(dataDir) : { files: {} };
+  const entries = Object.keys(index.files || {});
+  for (const relPath of entries) {
+    storage.deleteCloudObjectForPath(dataDir, relPath).catch(() => {});
+  }
+}
 const HIDDEN_SHARED_RELATIVE_PATHS = new Set(
   sharedDir === repoSharedSourceDir ? ['sync_download.py', '__pycache__'] : []
 );
@@ -79,6 +153,10 @@ if (args[0] === '--list') {
       if (e.name.startsWith('.')) continue;
       const rel = prefix ? `${prefix}/${e.name}` : e.name;
       if (isHiddenSharedRelPath(rel)) continue;
+      if (e.isSymbolicLink()) {
+        console.warn(`  跳过符号链接: ${rel}`);
+        continue;
+      }
       if (e.isDirectory()) {
         walk(path.join(dir, e.name), rel);
       } else {
@@ -101,6 +179,7 @@ if (args[0] === '--clear') {
     }
   }
   fs.mkdirSync(sharedDir, { recursive: true });
+  scheduleCloudClear();
   console.log(`${path.relative(process.cwd(), sharedDir) || '.'}/ 已清空`);
   process.exit(0);
 }
@@ -109,22 +188,40 @@ if (args[0] === '--clear') {
 fs.mkdirSync(sharedDir, { recursive: true });
 let count = 0;
 
-for (const src of args) {
+  for (const src of args) {
   const resolved = path.resolve(src);
   if (!fs.existsSync(resolved)) {
     console.error(`  跳过: ${src} (不存在)`);
     continue;
   }
-  const stat = fs.statSync(resolved);
+  const stat = fs.lstatSync(resolved);
+  if (stat.isSymbolicLink()) {
+    console.error(`  跳过: ${src} (符号链接不允许共享)`);
+    continue;
+  }
   const dest = path.join(sharedDir, path.basename(resolved));
 
   if (stat.isDirectory()) {
-    fs.cpSync(resolved, dest, { recursive: true });
+    fs.cpSync(resolved, dest, {
+      recursive: true,
+      dereference: false,
+      filter: (source) => !fs.lstatSync(source).isSymbolicLink(),
+    });
   } else {
     fs.copyFileSync(resolved, dest);
   }
   console.log(`  + ${path.basename(resolved)}`);
   count++;
+
+  const baseName = path.basename(resolved);
+  const scanRoot = stat.isDirectory() ? dest : path.join(sharedDir, baseName);
+  const relPrefix = stat.isDirectory() ? baseName : '';
+  const files = stat.isDirectory()
+    ? walkSharedFiles(scanRoot, relPrefix)
+    : [{ rel: baseName, full: scanRoot }];
+  for (const { rel, full } of files) {
+    scheduleCloudUpload(rel, full);
+  }
 }
 
 console.log(`共复制 ${count} 项到 ${path.relative(process.cwd(), sharedDir) || '.'}/`);

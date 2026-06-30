@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -5,14 +7,86 @@ const path = require('path');
 const { pipeline } = require('stream');
 const tar = require('tar');
 const packageJson = require('./package.json');
+const storage = require('./lib/cloud-storage');
+const chunkedAead = require('./lib/chunked-aead');
 
 const app = express();
+app.disable('x-powered-by');
+
+function cspSourceList(value) {
+  return String(value || '')
+    .split(/\s+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function normalizeBaseUrl(value) {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function normalizeBaseUrlList(value) {
+  return String(value || '')
+    .split(/[\s,]+/)
+    .map((entry) => normalizeBaseUrl(entry))
+    .filter(Boolean);
+}
+
+function cspOriginSource(value) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return '';
+  }
+}
+
+const CLIENT_PRIMARY_RELAY_URL = normalizeBaseUrl(process.env.CLIENT_PRIMARY_RELAY_URL || process.env.PRIMARY_RELAY_URL);
+const CLIENT_RELAY_BASE_URLS = Array.from(new Set([
+  CLIENT_PRIMARY_RELAY_URL,
+  ...normalizeBaseUrlList(process.env.CLIENT_RELAY_BASE_URLS || process.env.RELAY_BASE_URLS),
+].filter(Boolean)));
+const CLIENT_RELAY_ACCESS_KEY = process.env.CLIENT_RELAY_ACCESS_KEY || process.env.SYNCD_RELAY_ACCESS_KEY || '';
+const CLIENT_CF_INLINE_MAX_BYTES = Math.max(
+  0,
+  Number.parseInt(process.env.CLIENT_CF_INLINE_MAX_BYTES || String(200 * 1024), 10) || 0
+);
+const CLIENT_ALLOW_INSECURE_RELAY_FALLBACK = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.CLIENT_ALLOW_INSECURE_RELAY_FALLBACK || '').trim().toLowerCase()
+);
+const CSP_CONNECT_SRC = Array.from(new Set([
+  "'self'",
+  ...CLIENT_RELAY_BASE_URLS.map((entry) => cspOriginSource(entry)),
+  ...cspSourceList(process.env.CSP_CONNECT_SRC),
+].filter(Boolean)));
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader(
+    'Content-Security-Policy',
+    [
+      "default-src 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline'",
+      "font-src 'self'",
+      "img-src 'self' data: blob:",
+      `connect-src ${CSP_CONNECT_SRC.join(' ')}`,
+      "object-src 'none'",
+      "base-uri 'none'",
+      "frame-ancestors 'none'",
+    ].join('; ')
+  );
+  next();
+});
 app.use(express.json({
+  limit: process.env.JSON_BODY_LIMIT || '2mb',
   verify: (req, res, buf) => {
     req.rawBody = Buffer.from(buf);
   },
 }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+  dotfiles: 'ignore',
+  index: 'index.html',
+}));
 
 const MAX_TEXTS = 100;
 const TEXT_EXPIRY_MS = 24 * 60 * 60 * 1000;
@@ -23,6 +97,10 @@ const MAX_NONCES_PER_DEVICE = 512;
 const PAIR_SESSION_TTL_MS = Number.parseInt(process.env.PAIR_SESSION_TTL_MS || String(10 * 60 * 1000), 10);
 const DEVICE_LAST_SEEN_PERSIST_MS = 60 * 1000;
 const MAX_ARCHIVE_PATHS = 100;
+const CHUNKED_THRESHOLD_BYTES = Math.max(
+  1024 * 1024,
+  Number.parseInt(process.env.CHUNKED_THRESHOLD_BYTES || String(64 * 1024 * 1024), 10) || 64 * 1024 * 1024
+);
 let activeDownloads = 0;
 const seenRequestNonces = new Map();
 
@@ -109,6 +187,20 @@ function normalizeSharedRelPath(relPath) {
   return String(relPath || '')
     .replace(/\\/g, '/')
     .replace(/^\/+/, '');
+}
+
+function isPathInside(parent, candidate) {
+  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
+  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function getRealPathIfExists(candidate) {
+  try {
+    if (!fs.existsSync(candidate)) return null;
+    return fs.realpathSync(candidate);
+  } catch {
+    return null;
+  }
 }
 
 function matchesSharedRelPath(relPath, protectedPaths) {
@@ -386,6 +478,89 @@ function streamEncryptedResponse({ res, sourceStream, extraHeaders = {}, label, 
   });
 }
 
+function streamChunkedEncryptedResponse({ res, sourceStream, extraHeaders = {}, label, onComplete }) {
+  let completed = false;
+
+  const finish = (err) => {
+    if (completed) return;
+    completed = true;
+    if (onComplete) onComplete(err);
+  };
+
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Encryption-Format', 'chunked-aead-v1');
+
+  for (const [header, value] of Object.entries(extraHeaders)) {
+    res.setHeader(header, value);
+  }
+
+  const { stream } = chunkedAead.createChunkedAeadStream(sourceStream, masterKey);
+
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    const err = new Error('Client disconnected');
+    sourceStream.destroy(err);
+    stream.destroy(err);
+    finish(err);
+  });
+
+  pipeline(stream, res, (err) => {
+    if (completed) return;
+    if (err) {
+      console.error(`[${label}] Chunked stream error:`, err.message);
+      finish(err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: `${label} failed` });
+      } else if (!res.destroyed) {
+        res.destroy(err);
+      }
+      return;
+    }
+    finish();
+  });
+}
+
+function streamCachedEncryptedResponse({ res, sourceStream, extraHeaders = {}, label, onComplete }) {
+  let completed = false;
+
+  const finish = (err) => {
+    if (completed) return;
+    completed = true;
+    if (onComplete) onComplete(err);
+  };
+
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Encryption-Format', 'chunked-aead-v1');
+
+  for (const [header, value] of Object.entries(extraHeaders)) {
+    res.setHeader(header, value);
+  }
+
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    const err = new Error('Client disconnected');
+    sourceStream.destroy(err);
+    finish(err);
+  });
+
+  pipeline(sourceStream, res, (err) => {
+    if (completed) return;
+    if (err) {
+      console.error(`[${label}] Cached stream error:`, err.message);
+      finish(err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: `${label} failed` });
+      } else if (!res.destroyed) {
+        res.destroy(err);
+      }
+      return;
+    }
+    finish();
+  });
+}
+
 // ============ Pending Pairing Session ============
 // Ephemeral — only lives in memory, one at a time
 
@@ -474,6 +649,28 @@ app.get('/api/session', requireDeviceAuth, (req, res) => {
   });
 });
 
+app.get('/api/transport-config', requireDeviceAuth, (req, res) => {
+  const relayPayload = CLIENT_RELAY_ACCESS_KEY
+    ? encrypt(masterKey, Buffer.from(JSON.stringify({
+      version: 1,
+      relayAccessKey: CLIENT_RELAY_ACCESS_KEY,
+      authScheme: 'hmac-v1',
+      issuedAt: new Date().toISOString(),
+    })))
+    : null;
+
+  res.json({
+    primaryRelayBaseUrl: CLIENT_PRIMARY_RELAY_URL,
+    relayBaseUrls: CLIENT_RELAY_BASE_URLS,
+    cfInlineMaxBytes: CLIENT_CF_INLINE_MAX_BYTES,
+    allowInsecureRelayFallback: CLIENT_ALLOW_INSECURE_RELAY_FALLBACK,
+    relayAccessKeyAvailable: Boolean(CLIENT_RELAY_ACCESS_KEY),
+    relayAccessAuthScheme: CLIENT_RELAY_ACCESS_KEY ? 'hmac-v1' : '',
+    encryptedRelayAccessKey: relayPayload,
+    objectFallbackEnabled: storage.isStorageEnabled(),
+  });
+});
+
 app.get('/healthz', (req, res) => {
   const session = getPendingPair();
   res.json({
@@ -485,6 +682,17 @@ app.get('/healthz', (req, res) => {
     pendingPair: !!session,
     pendingPairExpiresAt: session ? session.expiresAt : null,
     uptimeSeconds: Math.floor(process.uptime()),
+  });
+});
+
+app.get('/api/client-config', (req, res) => {
+  res.json({
+    primaryRelayBaseUrl: CLIENT_PRIMARY_RELAY_URL,
+    relayBaseUrls: CLIENT_RELAY_BASE_URLS,
+    cfInlineMaxBytes: CLIENT_CF_INLINE_MAX_BYTES,
+    allowInsecureRelayFallback: CLIENT_ALLOW_INSECURE_RELAY_FALLBACK,
+    relayAccessKeyRequired: Boolean(CLIENT_PRIMARY_RELAY_URL && CLIENT_RELAY_ACCESS_KEY),
+    objectFallbackEnabled: storage.isStorageEnabled(),
   });
 });
 
@@ -627,6 +835,7 @@ function walkDir(dir, prefix = '') {
     const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
     if (isInternalSharedRelPath(relPath)) continue;
     const fullPath = path.join(dir, entry.name);
+    if (entry.isSymbolicLink()) continue;
     const stat = fs.statSync(fullPath);
     if (entry.isDirectory()) {
       results.push({ name: relPath, type: 'dir', modified: stat.mtime.toISOString() });
@@ -645,8 +854,13 @@ function resolveSharedEntry(relPath) {
     .replace(/\/{2,}/g, '/');
   if (isInternalSharedRelPath(normalized)) return null;
   const fullPath = path.resolve(path.join(sharedDir, normalized));
-  if (!fullPath.startsWith(path.resolve(sharedDir))) return null;
-  return { relPath: normalized, fullPath };
+  if (!isPathInside(sharedDir, fullPath)) return null;
+
+  const realSharedDir = getRealPathIfExists(sharedDir) || path.resolve(sharedDir);
+  const realFullPath = getRealPathIfExists(fullPath);
+  if (realFullPath && !isPathInside(realSharedDir, realFullPath)) return null;
+
+  return { relPath: normalized, fullPath: realFullPath || fullPath };
 }
 
 function getEntrySize(fullPath) {
@@ -657,9 +871,24 @@ function getEntrySize(fullPath) {
   let total = 0;
   for (const entry of fs.readdirSync(fullPath, { withFileTypes: true })) {
     if (entry.name.startsWith('.')) continue;
+    if (entry.isSymbolicLink()) continue;
     total += getEntrySize(path.join(fullPath, entry.name));
   }
   return total;
+}
+
+function containsSymlink(fullPath) {
+  if (!fs.existsSync(fullPath)) return false;
+  const stat = fs.lstatSync(fullPath);
+  if (stat.isSymbolicLink()) return true;
+  if (!stat.isDirectory()) return false;
+
+  for (const entry of fs.readdirSync(fullPath, { withFileTypes: true })) {
+    if (entry.name.startsWith('.')) continue;
+    if (entry.isSymbolicLink()) return true;
+    if (entry.isDirectory() && containsSymlink(path.join(fullPath, entry.name))) return true;
+  }
+  return false;
 }
 
 function prepareArchivePaths(paths) {
@@ -690,6 +919,9 @@ function prepareArchivePaths(paths) {
     if (!stat.isFile() && !stat.isDirectory()) {
       return { error: `Unsupported path: ${resolved.relPath}` };
     }
+    if (containsSymlink(resolved.fullPath)) {
+      return { error: `Path contains symbolic links: ${resolved.relPath}` };
+    }
     seen.add(resolved.relPath);
     uniquePaths.push(resolved.relPath);
     totalSize += getEntrySize(resolved.fullPath);
@@ -711,20 +943,71 @@ app.get('/api/files', requireDeviceAuth, (req, res) => {
   res.json({ encrypted: encrypt(masterKey, Buffer.from(JSON.stringify(tree))) });
 });
 
-app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
+app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, async (req, res) => {
   const resolved = resolveSharedEntry(req.params[0] || '');
   if (!resolved || !resolved.relPath) return res.status(403).json({ error: 'Access denied' });
   if (!fs.existsSync(resolved.fullPath) || !fs.statSync(resolved.fullPath).isFile()) return res.status(404).json({ error: 'Not found' });
-  
+
   const stat = fs.statSync(resolved.fullPath);
   const fileSize = stat.size;
-  
+
+  try {
+    const cloudInfo = await storage.getCloudRedirectInfo(DATA_DIR, resolved.relPath, resolved.fullPath);
+    if (cloudInfo) {
+      if (cloudInfo.proxy) {
+        if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
+          return res.status(503).json({ error: 'Too many concurrent downloads. Please try again later.' });
+        }
+
+        activeDownloads++;
+        const sourceStream = await storage.createCloudReadStream(DATA_DIR, cloudInfo);
+        streamCachedEncryptedResponse({
+          res,
+          sourceStream,
+          label: 'CACHE',
+          extraHeaders: {
+            'X-File-Name': encodeURIComponent(path.basename(resolved.relPath)),
+            'X-File-Size': String(fileSize),
+            'X-Storage-Backend': cloudInfo.backend || 'remote',
+          },
+          onComplete: (err) => {
+            activeDownloads--;
+            if (!err) {
+              logEvent('file_cache_downloaded', {
+                deviceId: req.authenticatedDeviceId,
+                path: resolved.relPath,
+                size: fileSize,
+                backend: cloudInfo.backend || 'remote',
+              });
+            }
+          },
+        });
+        return;
+      }
+
+      logEvent('file_cloud_redirect', {
+        deviceId: req.authenticatedDeviceId,
+        path: resolved.relPath,
+        size: fileSize,
+      });
+      return res.json({
+        cloud: cloudInfo,
+        filename: path.basename(resolved.relPath),
+        format: 'chunked-aead-v1',
+      });
+    }
+  } catch (err) {
+    console.error(`[Storage] Redirect check failed for ${resolved.relPath}:`, err.message);
+  }
+
   if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
     return res.status(503).json({ error: 'Too many concurrent downloads. Please try again later.' });
   }
 
   activeDownloads++;
-  streamEncryptedResponse({
+  const useChunked = fileSize > CHUNKED_THRESHOLD_BYTES;
+  const streamFn = useChunked ? streamChunkedEncryptedResponse : streamEncryptedResponse;
+  streamFn({
     res,
     sourceStream: fs.createReadStream(resolved.fullPath),
     label: 'FILE',
@@ -735,7 +1018,7 @@ app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
     onComplete: (err) => {
       activeDownloads--;
       if (!err) {
-        logEvent('file_downloaded', {
+        logEvent(useChunked ? 'file_chunked_downloaded' : 'file_downloaded', {
           deviceId: req.authenticatedDeviceId,
           path: resolved.relPath,
           size: fileSize,
@@ -747,13 +1030,68 @@ app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
 
 // ============ Batch Download ============
 
-app.post('/api/archive', requireDeviceAuth, (req, res) => {
+app.post('/api/archive', requireDeviceAuth, async (req, res) => {
   if (!fs.existsSync(sharedDir)) fs.mkdirSync(sharedDir, { recursive: true });
 
   const archive = prepareArchivePaths(req.body?.paths);
   if (archive.error) {
     return res.status(400).json({ error: archive.error });
   }
+
+  if (storage.isStorageEnabled() && archive.paths.length === 1) {
+    const single = archive.paths[0];
+    const resolved = resolveSharedEntry(single);
+    if (resolved && fs.existsSync(resolved.fullPath) && fs.statSync(resolved.fullPath).isFile()) {
+      try {
+        const cloudInfo = await storage.getCloudRedirectInfo(DATA_DIR, resolved.relPath, resolved.fullPath);
+        if (cloudInfo) {
+          if (cloudInfo.proxy) {
+            if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
+              return res.status(503).json({ error: 'Too many concurrent downloads. Please try again later.' });
+            }
+
+            activeDownloads++;
+            const sourceStream = await storage.createCloudReadStream(DATA_DIR, cloudInfo);
+            streamCachedEncryptedResponse({
+              res,
+              sourceStream,
+              label: 'ARCHIVE-CACHE',
+              extraHeaders: {
+                'X-File-Name': encodeURIComponent(path.basename(resolved.relPath)),
+                'X-File-Size': String(cloudInfo.size || fs.statSync(resolved.fullPath).size),
+                'X-Storage-Backend': cloudInfo.backend || 'remote',
+              },
+              onComplete: (err) => {
+                activeDownloads--;
+                if (!err) {
+                  logEvent('archive_cache_downloaded', {
+                    deviceId: req.authenticatedDeviceId,
+                    path: resolved.relPath,
+                    size: cloudInfo.size,
+                    backend: cloudInfo.backend || 'remote',
+                  });
+                }
+              },
+            });
+            return;
+          }
+
+          logEvent('archive_cloud_redirect', {
+            deviceId: req.authenticatedDeviceId,
+            path: resolved.relPath,
+            size: cloudInfo.size,
+          });
+          return res.json({
+            cloud: cloudInfo,
+            filename: path.basename(resolved.relPath),
+          });
+        }
+      } catch (err) {
+        console.error(`[Storage] Archive redirect check failed for ${resolved.relPath}:`, err.message);
+      }
+    }
+  }
+
   if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
     return res.status(503).json({ error: 'Too many concurrent downloads. Please try again later.' });
   }
@@ -874,6 +1212,423 @@ app.get('/api/texts', requireDeviceAuth, (req, res) => {
   res.json({ texts: sharedTexts });
 });
 
+app.get('/api/cloud/status', requireDeviceAuth, async (req, res) => {
+  try {
+    const config = storage.loadStorageConfig();
+    if (!config.enabled) {
+      return res.json({ enabled: false });
+    }
+
+    const now = new Date();
+    const nextReset = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+
+    if (config.provider === 'qiniu') {
+      try {
+        const qiniu = require('qiniu');
+        const https = require('https');
+        const mac = new qiniu.auth.digest.Mac(config.accessKeyId, config.secretAccessKey);
+        const { S3Client, ListObjectsV2Command } = require('@aws-sdk/client-s3');
+        const s3Client = new S3Client({
+          endpoint: config.endpoint,
+          region: config.region,
+          credentials: { accessKeyId: config.accessKeyId, secretAccessKey: config.secretAccessKey },
+          forcePathStyle: true,
+        });
+
+        let totalSize = 0;
+        let objectCount = 0;
+        let continuationToken = null;
+
+        do {
+          const result = await s3Client.send(new ListObjectsV2Command({
+            Bucket: config.bucket,
+            MaxKeys: 1000,
+            ContinuationToken: continuationToken || undefined,
+          }));
+
+          for (const obj of result.Contents || []) {
+            totalSize += obj.Size || 0;
+            objectCount++;
+          }
+
+          continuationToken = result.IsTruncated ? result.NextContinuationToken : null;
+        } while (continuationToken);
+
+        const maxBytes = Math.max(0, Number.parseInt(process.env.QINIU_MAX_BYTES || '10737418240', 10) || 10737418240);
+
+        let trafficUsed = 0;
+        let getRequests = 0;
+        try {
+          const today = new Date();
+          const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+          const monthEnd = new Date(today.getFullYear(), today.getMonth() + 1, 1);
+          const begin = monthStart.toISOString().replace(/[-:T]/g, '').slice(0, 14);
+          const end = monthEnd.toISOString().replace(/[-:T]/g, '').slice(0, 14);
+
+          const flowRes = await new Promise((resolve, reject) => {
+            const path = `/v6/blob_io?begin=${begin}&end=${end}&g=day&select=flow&\$metric=flow_out`;
+            const token = qiniu.util.generateAccessToken(mac, `https://api.qiniuapi.com${path}`);
+            const options = {
+              hostname: 'api.qiniuapi.com',
+              path,
+              method: 'GET',
+              headers: { Authorization: token },
+            };
+            const req = https.request(options, (res) => {
+              let data = '';
+              res.on('data', (chunk) => data += chunk);
+              res.on('end', () => {
+                try { resolve(JSON.parse(data)); } catch { resolve(data); }
+              });
+            });
+            req.on('error', reject);
+            req.end();
+          });
+
+          if (Array.isArray(flowRes)) {
+            for (const day of flowRes) {
+              trafficUsed += day.values?.flow || 0;
+            }
+          }
+
+          const hitsRes = await new Promise((resolve, reject) => {
+            const path = `/v6/blob_io?begin=${begin}&end=${end}&g=day&select=hits&\$metric=hits`;
+            const token = qiniu.util.generateAccessToken(mac, `https://api.qiniuapi.com${path}`);
+            const options = {
+              hostname: 'api.qiniuapi.com',
+              path,
+              method: 'GET',
+              headers: { Authorization: token },
+            };
+            const req = https.request(options, (res) => {
+              let data = '';
+              res.on('data', (chunk) => data += chunk);
+              res.on('end', () => {
+                try { resolve(JSON.parse(data)); } catch { resolve(data); }
+              });
+            });
+            req.on('error', reject);
+            req.end();
+          });
+
+          if (Array.isArray(hitsRes)) {
+            for (const day of hitsRes) {
+              getRequests += day.values?.hits || 0;
+            }
+          }
+        } catch (trafficErr) {
+          console.error('[Cloud Status] Traffic check failed:', trafficErr.message);
+        }
+
+        let cdnTrafficUsed = 0;
+        try {
+          const cdnStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+          const cdnEnd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+          const cdnBody = JSON.stringify({ startDate: cdnStart, endDate: cdnEnd, granularity: 'day', domains: 'tgazj2p2k.hd-bkt.clouddn.com' });
+          const cdnPath = '/v2/tune/flux';
+          const cdnUrl = `https://fusion.qiniuapi.com${cdnPath}`;
+          const cdnToken = qiniu.util.generateAccessToken(mac, cdnUrl);
+
+          const cdnRes = await new Promise((resolve, reject) => {
+            const bodyBuf = Buffer.from(cdnBody);
+            const opts = {
+              hostname: 'fusion.qiniuapi.com', path: cdnPath, method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: cdnToken, 'Content-Length': String(bodyBuf.length) },
+            };
+            const req = https.request(opts, (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve({}); } }); });
+            req.on('error', reject);
+            req.write(bodyBuf);
+            req.end();
+          });
+
+          if (cdnRes.code === 200 && cdnRes.data) {
+            const domain = cdnRes.data['tgazj2p2k.hd-bkt.clouddn.com'];
+            if (domain && domain.china) {
+              for (const val of domain.china) { cdnTrafficUsed += val || 0; }
+            }
+          }
+        } catch (cdnErr) {
+          console.error('[Cloud Status] CDN traffic check failed:', cdnErr.message);
+        }
+
+        return res.json({
+          enabled: true,
+          provider: config.provider,
+          bucket: config.bucket,
+          storageUsed: totalSize,
+          storageLimit: maxBytes,
+          objectCount,
+          usagePercent: maxBytes > 0 ? ((totalSize / maxBytes) * 100).toFixed(2) : 0,
+          trafficUsed,
+          trafficLimit: 10737418240,
+          cdnTrafficUsed,
+          cdnTrafficLimit: 10737418240,
+          getRequests,
+          getRequestsLimit: 1000000,
+          nextResetAt: nextReset.toISOString(),
+          daysUntilReset: Math.ceil((nextReset - now) / (1000 * 60 * 60 * 24)),
+        });
+      } catch (err) {
+        console.error('[Cloud Status] Qiniu check failed:', err.message);
+        return res.json({
+          enabled: true,
+          provider: config.provider,
+          bucket: config.bucket,
+          error: err.message,
+          nextResetAt: nextReset.toISOString(),
+        });
+      }
+    }
+
+    res.json({
+      enabled: true,
+      provider: config.provider,
+      bucket: config.bucket,
+      nextResetAt: nextReset.toISOString(),
+    });
+  } catch (err) {
+    console.error('[Cloud Status] Failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+function escapeHtml(str) {
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+
+function loadSettings() {
+  try {
+    if (fs.existsSync(SETTINGS_FILE)) return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+  } catch {}
+  return {};
+}
+
+function saveSettings(data) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2));
+}
+
+app.get('/api/settings', requireDeviceAuth, (req, res) => {
+  const settings = loadSettings();
+  res.json({
+    shareSingleUse: settings.shareSingleUse !== false,
+  });
+});
+
+app.post('/api/settings', requireDeviceAuth, (req, res) => {
+  const settings = loadSettings();
+  if (typeof req.body?.shareSingleUse === 'boolean') {
+    settings.shareSingleUse = req.body.shareSingleUse;
+  }
+  saveSettings(settings);
+  res.json({
+    shareSingleUse: settings.shareSingleUse !== false,
+  });
+});
+
+const SHARE_TOKEN_FILE = path.join(DATA_DIR, 'share-tokens.json');
+
+function loadShareTokens() {
+  try {
+    if (fs.existsSync(SHARE_TOKEN_FILE)) {
+      return JSON.parse(fs.readFileSync(SHARE_TOKEN_FILE, 'utf8'));
+    }
+  } catch (e) { console.error('[Share] Failed to load tokens:', e.message); }
+  return { tokens: {} };
+}
+
+function saveShareTokens(data) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(SHARE_TOKEN_FILE, JSON.stringify(data, null, 2));
+}
+
+function generateShareToken() {
+  const chars = '23456789abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ';
+  const bytes = crypto.randomBytes(8);
+  let token = '';
+  for (let i = 0; i < 8; i++) {
+    token += chars[bytes[i] % chars.length];
+  }
+  return token;
+}
+
+// Create share link (requires device auth)
+app.post('/api/share/create', requireDeviceAuth, (req, res) => {
+  if (process.env.SHARE_ENABLED === 'false') {
+    return res.status(403).json({ error: 'Share feature is disabled' });
+  }
+
+  const filePath = req.body?.path;
+  if (!filePath || typeof filePath !== 'string') {
+    return res.status(400).json({ error: 'Missing path' });
+  }
+
+  const resolved = resolveSharedEntry(filePath);
+  if (!resolved || !resolved.relPath) return res.status(403).json({ error: 'Access denied' });
+  if (!fs.existsSync(resolved.fullPath) || !fs.statSync(resolved.fullPath).isFile()) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+
+  const data = loadShareTokens();
+  const token = generateShareToken();
+
+  data.tokens[token] = {
+    relPath: resolved.relPath,
+    filename: path.basename(resolved.relPath),
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+    downloadCount: 0,
+    maxDownloads: loadSettings().shareSingleUse !== false ? 1 : 50,
+  };
+  saveShareTokens(data);
+
+  const host = req.get('host') || 'localhost:21891';
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+  res.json({ url: `${protocol}://${host}/s/${token}`, token });
+});
+
+// Short share link page
+app.get('/s/:token', (req, res) => {
+  if (process.env.SHARE_ENABLED === 'false') {
+    return res.status(403).send('<h1>分享功能已关闭</h1>');
+  }
+  const data = loadShareTokens();
+  const entry = data.tokens[req.params.token];
+
+  if (!entry) return res.status(404).send('<h1>Link not found or expired</h1>');
+
+  const filename = entry.filename || 'download';
+  const safeFilename = escapeHtml(filename);
+  const dlUrl = `/api/share/${req.params.token}`;
+
+  res.send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>${safeFilename}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #111; color: #ccc; }
+  .card { text-align: center; padding: 2rem; }
+  h1 { color: #fff; font-size: 1.2rem; margin-bottom: 0.5rem; }
+  .filename { color: #34d399; font-weight: 600; word-break: break-all; }
+  .size { color: #666; font-size: 0.85rem; margin: 0.5rem 0 1.5rem; }
+  .btn { display: inline-block; padding: 0.75rem 2rem; background: #34d399; color: #000; border-radius: 8px; text-decoration: none; font-weight: 600; }
+  .btn:hover { background: #2ec08a; }
+  .meta { font-size: 0.75rem; color: #555; margin-top: 1rem; }
+</style></head><body>
+<div class="card">
+  <h1>📦 文件分享</h1>
+  <p class="filename">${safeFilename}</p>
+  <p class="size">一次性下载 · 7 天后过期</p>
+  <a class="btn" href="${dlUrl}" download="${safeFilename}">下载文件</a>
+  <p class="meta">由 cloudsysncd 分享 · 链接随机生成，仅分享对象可用</p>
+</div>
+</body></html>`);
+});
+
+// Serve shared file (no auth required)
+app.get('/api/share/:token', async (req, res) => {
+  if (process.env.SHARE_ENABLED === 'false') {
+    return res.status(403).json({ error: 'Share feature is disabled' });
+  }
+  const data = loadShareTokens();
+  const entry = data.tokens[req.params.token];
+
+  if (!entry) return res.status(404).json({ error: 'Link not found or expired' });
+
+  const expiresAt = new Date(entry.expiresAt).getTime();
+  if (Date.now() > expiresAt) {
+    delete data.tokens[req.params.token];
+    saveShareTokens(data);
+    return res.status(410).json({ error: 'Link has expired' });
+  }
+
+  if (entry.downloadCount >= entry.maxDownloads) {
+    return res.status(429).json({ error: 'Download limit reached' });
+  }
+
+  const resolved = resolveSharedEntry(entry.relPath);
+  if (!resolved || !resolved.relPath || !fs.existsSync(resolved.fullPath)) {
+    return res.status(404).json({ error: 'File no longer available' });
+  }
+
+  entry.downloadCount++;
+  entry.lastDownloadedAt = new Date().toISOString();
+  saveShareTokens(data);
+
+  const stat = fs.statSync(resolved.fullPath);
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(entry.filename)}`);
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Length', String(stat.size));
+
+  pipeline(fs.createReadStream(resolved.fullPath), res, (err) => {
+    if (err) console.error('[Share] Pipeline error:', err.message);
+  });
+});
+
+const pendingUploads = new Map();
+
+function startSharedDirWatcher() {
+  if (!storage.isStorageEnabled()) return;
+  if (!fs.existsSync(sharedDir)) fs.mkdirSync(sharedDir, { recursive: true });
+
+  const state = loadState();
+  if (!state || !state.masterKey) {
+    console.log('[Watcher] No master key, skipping auto-upload');
+    return;
+  }
+  const masterKey = Buffer.from(state.masterKey, 'hex');
+
+  fs.watch(sharedDir, (eventType, filename) => {
+    if (!filename) return;
+    if (filename.startsWith('.')) return;
+    if (filename.includes('__pycache__')) return;
+
+    const fullPath = path.join(sharedDir, filename);
+    if (!fs.existsSync(fullPath)) return;
+    if (fs.lstatSync(fullPath).isSymbolicLink()) return;
+    if (fs.statSync(fullPath).isDirectory()) return;
+    const relPath = path.relative(sharedDir, fullPath).replace(/\\/g, '/');
+
+    if (HIDDEN_SHARED_RELATIVE_PATHS.has(relPath)) return;
+    if (PROTECTED_SHARED_RELATIVE_PATHS.has(relPath)) return;
+
+    if (eventType === 'rename' || eventType === 'change') {
+      if (pendingUploads.has(relPath)) {
+        clearTimeout(pendingUploads.get(relPath));
+      }
+
+      pendingUploads.set(relPath, setTimeout(() => {
+        pendingUploads.delete(relPath);
+        if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) return;
+
+        const index = storage.loadIndex(DATA_DIR);
+        const existing = index.files[relPath];
+        if (existing) {
+          const stat = fs.statSync(fullPath);
+          const existingSize = existing.size || 0;
+          if (existingSize === stat.size) {
+            return;
+          }
+        }
+
+        console.log(`[Watcher] Auto-uploading: ${relPath}`);
+        storage.uploadFileToCloud(DATA_DIR, masterKey, relPath, fullPath)
+          .then((result) => {
+            if (result) {
+              console.log(`[Watcher] Uploaded: ${relPath}`);
+            }
+          })
+          .catch((err) => {
+            console.error(`[Watcher] Upload failed for ${relPath}:`, err.message);
+          });
+      }, 2000));
+    }
+  });
+
+  console.log(`[Watcher] Watching ${sharedDir} for auto-upload`);
+}
+
 // ============ Start Server ============
 
 const PORT = process.env.PORT || 21891;
@@ -887,4 +1642,13 @@ app.listen(PORT, () => {
   } else {
     console.log('\nReady. Run `node pin.js` to generate a PIN for a new device.\n');
   }
+
+  if (storage.isStorageEnabled()) {
+    storage.cleanupOrphanedObjects(DATA_DIR, sharedDir).catch((err) => {
+      console.error('[Storage] Startup cleanup failed:', err.message);
+    });
+    storage.startPeriodicCleanup(DATA_DIR, sharedDir);
+  }
+
+  startSharedDirWatcher();
 });

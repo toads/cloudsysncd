@@ -31,7 +31,7 @@ const Crypto = {
   },
 
   async hkdf(ikm, salt, info, length = 32) {
-    const baseKey = await window.crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+    const baseKey = await window.crypto.subtle.importKey('raw', ikm, { name: 'HKDF' }, false, ['deriveBits']);
     const bits = await window.crypto.subtle.deriveBits({
       name: 'HKDF',
       hash: 'SHA-256',
@@ -110,6 +110,20 @@ async function sha256Hex(data) {
   const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
   const digest = await window.crypto.subtle.digest('SHA-256', bytes);
   return buf2hex(new Uint8Array(digest));
+}
+
+function normalizeBaseUrl(value) {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function buildRequestUrl(pathname, baseUrl = '') {
+  const normalizedBase = normalizeBaseUrl(baseUrl);
+  return normalizedBase ? `${normalizedBase}${pathname}` : pathname;
+}
+
+function normalizeBaseUrlList(value) {
+  const entries = Array.isArray(value) ? value : String(value || '').split(/[\s,]+/);
+  return Array.from(new Set(entries.map((entry) => normalizeBaseUrl(entry)).filter(Boolean)));
 }
 
 // ============ Key Storage (IndexedDB) ============
@@ -213,12 +227,6 @@ function escapeHtml(value) {
   return div.innerHTML;
 }
 
-function formatSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-}
-
 function formatCountdown(expiresAt) {
   const remainingMs = Date.parse(expiresAt) - Date.now();
   if (!Number.isFinite(remainingMs) || remainingMs <= 0) return '00:00';
@@ -238,15 +246,30 @@ function downloadBuffer(filename, plainBuf) {
   URL.revokeObjectURL(url);
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ============ Global State ============
 
 const PAGE_SIZE = 100;
 const MAX_BROWSER_DOWNLOAD_BYTES = 64 * 1024 * 1024;
 const TEXT_REFRESH_MS = 15000;
+const DEFAULT_CF_INLINE_MAX_BYTES = 200 * 1024;
+const PREFERRED_RELAY_BASE_URL_KEY = 'syncdPreferredRelayBaseUrl';
 
 let encryptionKey = null;
 let deviceId = null;
 let deviceRecord = null;
+let clientConfig = {
+  primaryRelayBaseUrl: '',
+  relayBaseUrls: [],
+  cfInlineMaxBytes: DEFAULT_CF_INLINE_MAX_BYTES,
+  allowInsecureRelayFallback: false,
+  relayAccessKeyRequired: false,
+  relayAccessKey: '',
+  objectFallbackEnabled: false,
+};
 let pairing = false;
 let textSending = false;
 
@@ -268,19 +291,434 @@ let isRenderingPage = false;
 let selectionMode = false;
 let selectedFiles = new Set();
 let loadedTexts = [];
+let activeRowDownloads = new Map();
+
+class ChunkedAeadParser {
+  constructor(keyBytes) {
+    this.keyBytes = keyBytes;
+    this.buffer = new Uint8Array(0);
+    this.state = 'header';
+    this.chunkSize = null;
+    this.iv = null;
+    this.ciphertextLength = null;
+    this.ciphertext = null;
+    this.cachedKey = null;
+  }
+
+  push(data) {
+    const newBuffer = new Uint8Array(this.buffer.length + data.length);
+    newBuffer.set(this.buffer);
+    newBuffer.set(data, this.buffer.length);
+    this.buffer = newBuffer;
+  }
+
+  consume(n) {
+    const result = this.buffer.subarray(0, n);
+    this.buffer = this.buffer.subarray(n);
+    return result;
+  }
+
+  async importKey() {
+    if (!this.cachedKey) {
+      this.cachedKey = await window.crypto.subtle.importKey('raw', this.keyBytes, 'AES-GCM', false, ['decrypt']);
+    }
+    return this.cachedKey;
+  }
+
+  async process(controller) {
+    while (true) {
+      if (this.state === 'header') {
+        if (this.buffer.length < 16) return;
+        const header = this.consume(16);
+        if (header[0] !== 0x53 || header[1] !== 0x59 || header[2] !== 0x4E || header[3] !== 0x43) {
+          throw new Error('Invalid chunked AEAD magic');
+        }
+        if (header[4] !== 1) throw new Error('Unsupported chunked AEAD version');
+        this.chunkSize = (header[5] << 24) | (header[6] << 16) | (header[7] << 8) | header[8];
+        this.state = 'iv';
+      } else if (this.state === 'iv') {
+        if (this.buffer.length < 12) return;
+        this.iv = this.consume(12);
+        this.state = 'length';
+      } else if (this.state === 'length') {
+        if (this.buffer.length < 4) return;
+        const lenBytes = this.consume(4);
+        this.ciphertextLength = (lenBytes[0] << 24) | (lenBytes[1] << 16) | (lenBytes[2] << 8) | lenBytes[3];
+        this.state = 'ciphertext';
+      } else if (this.state === 'ciphertext') {
+        if (this.buffer.length < this.ciphertextLength) return;
+        this.ciphertext = this.consume(this.ciphertextLength);
+        this.state = 'tag';
+      } else if (this.state === 'tag') {
+        if (this.buffer.length < 16) return;
+        const tag = this.consume(16);
+        const key = await this.importKey();
+        const combined = new Uint8Array(this.ciphertext.length + tag.length);
+        combined.set(this.ciphertext);
+        combined.set(tag, this.ciphertext.length);
+        const plaintext = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv: this.iv }, key, combined);
+        controller.enqueue(new Uint8Array(plaintext));
+        this.iv = null;
+        this.ciphertext = null;
+        this.ciphertextLength = null;
+        this.state = 'iv';
+      }
+    }
+  }
+}
+
+function createChunkedAeadDecryptStream(keyBytes) {
+  const parser = new ChunkedAeadParser(keyBytes);
+  return new TransformStream({
+    async transform(chunk, controller) {
+      parser.push(new Uint8Array(chunk));
+      await parser.process(controller);
+    },
+    flush(controller) {
+      if (parser.state !== 'iv' || parser.buffer.length > 0) {
+        controller.error(new Error('Incomplete chunked AEAD stream'));
+      }
+    },
+  });
+}
+
+const DOWNLOAD_DB_NAME = 'syncd-downloads';
+const DOWNLOAD_DB_VERSION = 1;
+const DOWNLOAD_STORE = 'chunks';
+
+async function openDownloadDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DOWNLOAD_DB_NAME, DOWNLOAD_DB_VERSION);
+    req.onerror = () => reject(req.error);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(DOWNLOAD_STORE)) {
+        db.createObjectStore(DOWNLOAD_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+  });
+}
+
+async function clearDownloadStore(db, keyPrefix) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DOWNLOAD_STORE, 'readwrite');
+    const store = tx.objectStore(DOWNLOAD_STORE);
+    const range = IDBKeyRange.bound(keyPrefix + '\x00', keyPrefix + '\xFF');
+    const req = store.openCursor(range);
+    req.onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (cursor) {
+        store.delete(cursor.key);
+        cursor.continue();
+      }
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function writeDownloadChunk(db, key, chunk) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DOWNLOAD_STORE, 'readwrite');
+    const store = tx.objectStore(DOWNLOAD_STORE);
+    store.put(chunk, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function readDownloadChunks(db, keyPrefix) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DOWNLOAD_STORE, 'readonly');
+    const store = tx.objectStore(DOWNLOAD_STORE);
+    const range = IDBKeyRange.bound(keyPrefix + '\x00', keyPrefix + '\xFF');
+    const chunks = [];
+    const req = store.openCursor(range);
+    req.onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (cursor) {
+        chunks.push(cursor.value);
+        cursor.continue();
+      } else {
+        resolve(chunks);
+      }
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function streamDownloadToFile(stream, filename, onProgress) {
+  let reader = stream.getReader();
+
+  try {
+    return await downloadViaIndexedDB(reader, filename, onProgress);
+  } catch (indexedDbErr) {
+    console.warn('[Download] IndexedDB failed, trying File System Access API:', indexedDbErr.message);
+
+    if (window.showSaveFilePicker) {
+      try {
+        return await downloadViaFileSystemAPI(reader, filename, onProgress);
+      } catch (fsErr) {
+        if (fsErr.name === 'AbortError') return { cancelled: true };
+        console.warn('[Download] File System Access API failed, falling back to memory:', fsErr.message);
+      }
+    }
+
+    return await downloadViaMemory(reader, filename, onProgress);
+  }
+}
+
+async function downloadViaIndexedDB(reader, filename, onProgress) {
+  const db = await openDownloadDB();
+  const keyPrefix = 'dl:' + Date.now() + ':';
+  let chunkIndex = 0;
+  let total = 0;
+
+  try {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        await writeDownloadChunk(db, keyPrefix + chunkIndex, value);
+        chunkIndex++;
+        total += value.length;
+        if (onProgress) onProgress(total);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const chunks = await readDownloadChunks(db, keyPrefix);
+    const blob = new Blob(chunks);
+    downloadBlob(filename, blob);
+    return { saved: true, bytes: total };
+  } finally {
+    await clearDownloadStore(db, keyPrefix);
+    db.close();
+  }
+}
+
+async function downloadViaFileSystemAPI(reader, filename, onProgress) {
+  const handle = await window.showSaveFilePicker({ suggestedName: filename });
+  const writable = await handle.createWritable();
+  let received = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await writable.write(value);
+      received += value.length;
+      if (onProgress) onProgress(received);
+    }
+  } finally {
+    reader.releaseLock();
+    await writable.close();
+  }
+
+  return { saved: true, bytes: received };
+}
+
+async function downloadViaMemory(reader, filename, onProgress) {
+  const chunks = [];
+  let total = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.length;
+      if (total > MAX_BROWSER_DOWNLOAD_BYTES) {
+        throw new Error(`浏览器内存限制：无法保存超过 ${formatBytes(MAX_BROWSER_DOWNLOAD_BYTES)} 的文件，请改用 Python CLI。`);
+      }
+      if (onProgress) onProgress(total);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const blob = new Blob(chunks);
+  downloadBlob(filename, blob);
+  return { saved: true, bytes: total };
+}
+
+function downloadBlob(filename, blob) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
 
 // ============ Networking ============
 
-async function decryptDownloadResponse(response) {
+async function loadClientConfig() {
+  try {
+    const response = await fetch('/api/client-config', { cache: 'no-store' });
+    if (!response.ok) return;
+    const data = await response.json();
+    const relayBaseUrls = normalizeBaseUrlList(data.relayBaseUrls || data.primaryRelayBaseUrl);
+    clientConfig = {
+      primaryRelayBaseUrl: normalizeBaseUrl(data.primaryRelayBaseUrl || relayBaseUrls[0] || ''),
+      relayBaseUrls,
+      cfInlineMaxBytes: Math.max(0, Number(data.cfInlineMaxBytes) || DEFAULT_CF_INLINE_MAX_BYTES),
+      allowInsecureRelayFallback: Boolean(data.allowInsecureRelayFallback),
+      relayAccessKeyRequired: data.relayAccessKeyRequired !== false,
+      relayAccessKey: clientConfig.relayAccessKey || '',
+      objectFallbackEnabled: Boolean(data.objectFallbackEnabled),
+    };
+  } catch {
+    clientConfig = {
+      primaryRelayBaseUrl: '',
+      relayBaseUrls: [],
+      cfInlineMaxBytes: DEFAULT_CF_INLINE_MAX_BYTES,
+      allowInsecureRelayFallback: false,
+      relayAccessKeyRequired: false,
+      relayAccessKey: '',
+      objectFallbackEnabled: false,
+    };
+  }
+}
+
+async function loadTransportConfig() {
+  try {
+    const response = await apiFetch('/api/transport-config');
+    if (!response.ok) return;
+    const data = await response.json();
+    let relayAccessKey = '';
+    if (data.encryptedRelayAccessKey) {
+      const plain = await Crypto.decrypt(
+        encryptionKey,
+        data.encryptedRelayAccessKey.iv,
+        data.encryptedRelayAccessKey.ciphertext,
+        data.encryptedRelayAccessKey.tag
+      );
+      const payload = JSON.parse(new TextDecoder().decode(plain));
+      relayAccessKey = String(payload.relayAccessKey || '');
+    } else if (data.relayAccessKey) {
+      relayAccessKey = String(data.relayAccessKey || '');
+    }
+    const relayBaseUrls = normalizeBaseUrlList(
+      (data.relayBaseUrls && data.relayBaseUrls.length ? data.relayBaseUrls : data.primaryRelayBaseUrl)
+        || clientConfig.relayBaseUrls
+        || clientConfig.primaryRelayBaseUrl
+    );
+    clientConfig = {
+      ...clientConfig,
+      primaryRelayBaseUrl: normalizeBaseUrl(data.primaryRelayBaseUrl || relayBaseUrls[0] || clientConfig.primaryRelayBaseUrl),
+      relayBaseUrls,
+      cfInlineMaxBytes: Math.max(0, Number(data.cfInlineMaxBytes) || clientConfig.cfInlineMaxBytes || DEFAULT_CF_INLINE_MAX_BYTES),
+      allowInsecureRelayFallback: Boolean(data.allowInsecureRelayFallback),
+      relayAccessKeyRequired: Boolean(relayBaseUrls.length > 0 && data.relayAccessKeyAvailable),
+      relayAccessKey,
+      objectFallbackEnabled: Boolean(data.objectFallbackEnabled),
+    };
+  } catch (err) {
+    console.warn('Failed to load transport config:', err);
+  }
+}
+
+function findFileEntry(name) {
+  return allEntries.find((entry) => entry.type === 'file' && entry.name === name) || null;
+}
+
+function getEntriesTotalSize(paths) {
+  let total = 0;
+  for (const name of paths) {
+    const entry = findFileEntry(name);
+    if (!entry) return Number.POSITIVE_INFINITY;
+    total += Number(entry.size) || 0;
+  }
+  return total;
+}
+
+function shouldPreferRelay(totalSize) {
+  return getUsableRelayBaseUrls().length > 0
+    && Number.isFinite(totalSize)
+    && totalSize > clientConfig.cfInlineMaxBytes;
+}
+
+function isRelayBaseUrlUsableInBrowser(baseUrl) {
+  try {
+    const url = new URL(baseUrl);
+    if (window.location.protocol === 'https:' && url.protocol === 'http:') {
+      if (clientConfig.allowInsecureRelayFallback) return true;
+      const hostname = url.hostname.toLowerCase();
+      return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+    }
+    return url.protocol === 'https:' || url.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+function getRelayBaseUrls() {
+  const urls = normalizeBaseUrlList(
+    clientConfig.relayBaseUrls && clientConfig.relayBaseUrls.length
+      ? clientConfig.relayBaseUrls
+      : clientConfig.primaryRelayBaseUrl
+  );
+  let preferred = '';
+  try {
+    preferred = normalizeBaseUrl(localStorage.getItem(PREFERRED_RELAY_BASE_URL_KEY));
+  } catch {
+    preferred = '';
+  }
+  if (!preferred || !urls.includes(preferred)) return urls;
+  return [preferred];
+}
+
+function getUsableRelayBaseUrls() {
+  return getRelayBaseUrls().filter((entry) => isRelayBaseUrlUsableInBrowser(entry));
+}
+
+function getRelayAccessKeyForDownload() {
+  if (getRelayBaseUrls().length === 0) return '';
+  return clientConfig.relayAccessKey || '';
+}
+
+async function readResponseBytesWithProgress(response, onProgress) {
+  if (!response.body) return new Uint8Array(await response.arrayBuffer());
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.length;
+      if (onProgress) onProgress(total);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const payload = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    payload.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return payload;
+}
+
+async function decryptDownloadResponse(response, { onProgress } = {}) {
+  const format = response.headers.get('x-encryption-format');
   const streamIv = response.headers.get('x-encrypted-iv');
-  if (streamIv) {
+  if (streamIv && format !== 'chunked-aead-v1') {
     const declaredSize = Number.parseInt(response.headers.get('x-file-size') || '0', 10);
     if (Number.isFinite(declaredSize) && declaredSize > MAX_BROWSER_DOWNLOAD_BYTES) {
-      throw new Error(`浏览器暂不支持直接解密超过 ${formatSize(MAX_BROWSER_DOWNLOAD_BYTES)} 的单文件，请改用 Python CLI`);
+      throw new Error(`浏览器暂不支持直接解密超过 ${formatBytes(MAX_BROWSER_DOWNLOAD_BYTES)} 的单文件，请改用 Python CLI`);
     }
 
     const tagLength = Number.parseInt(response.headers.get('x-encrypted-tag-length') || '16', 10);
-    const payload = new Uint8Array(await response.arrayBuffer());
+    const payload = await readResponseBytesWithProgress(response, onProgress);
     if (payload.length < tagLength) {
       throw new Error('Encrypted payload is truncated');
     }
@@ -291,14 +729,66 @@ async function decryptDownloadResponse(response) {
     return {
       filename: safeDecodeHeader(response.headers.get('x-file-name')),
       plainBuf,
+      totalSize: declaredSize,
     };
   }
 
-  const { encrypted } = await response.json();
-  return {
-    filename: encrypted.filename || '',
-    plainBuf: await Crypto.decrypt(encryptionKey, encrypted.iv, encrypted.ciphertext, encrypted.tag),
-  };
+  if (format === 'chunked-aead-v1') {
+    const declaredSize = Number.parseInt(response.headers.get('x-file-size') || '0', 10);
+    return {
+      filename: safeDecodeHeader(response.headers.get('x-file-name')),
+      stream: response.body.pipeThrough(createChunkedAeadDecryptStream(encryptionKey)),
+      isStream: true,
+      totalSize: declaredSize,
+    };
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    const data = await response.json();
+    if (data.cloud && data.cloud.url) {
+      const cloudResponse = await fetch(data.cloud.url);
+      if (!cloudResponse.ok) {
+        throw new Error(`远端对象下载失败: HTTP ${cloudResponse.status}`);
+      }
+
+      const cloudFormat = cloudResponse.headers.get('x-encryption-format') || data.cloud.format;
+      if (cloudFormat === 'chunked-aead-v1') {
+        return {
+          filename: data.filename || '',
+          stream: cloudResponse.body.pipeThrough(createChunkedAeadDecryptStream(encryptionKey)),
+          isStream: true,
+          totalSize: data.cloud.size || 0,
+        };
+      }
+
+      if (Number.isFinite(data.cloud.size) && data.cloud.size > MAX_BROWSER_DOWNLOAD_BYTES) {
+        throw new Error(`浏览器暂不支持直接解密超过 ${formatBytes(MAX_BROWSER_DOWNLOAD_BYTES)} 的单文件，请改用 Python CLI`);
+      }
+      const tagLength = 16;
+      const payload = await readResponseBytesWithProgress(cloudResponse, onProgress);
+      if (payload.length < tagLength) {
+        throw new Error('远端对象加密数据已截断');
+      }
+      const ciphertext = payload.subarray(0, payload.length - tagLength);
+      const tag = payload.subarray(payload.length - tagLength);
+      const plainBuf = await Crypto.decryptBytes(encryptionKey, hex2buf(data.cloud.iv), ciphertext, tag);
+      return {
+        filename: data.filename || '',
+        plainBuf,
+        totalSize: data.cloud.size || 0,
+      };
+    }
+    if (data.encrypted) {
+      return {
+        filename: data.encrypted.filename || '',
+        plainBuf: await Crypto.decrypt(encryptionKey, data.encrypted.iv, data.encrypted.ciphertext, data.encrypted.tag),
+        totalSize: 0,
+      };
+    }
+  }
+
+  throw new Error('Unrecognized download response format');
 }
 
 function buildSignedPath(pathname) {
@@ -350,6 +840,7 @@ async function maybeHandleAuthFailure(response) {
 }
 
 async function apiFetch(pathname, options = {}) {
+  const transport = options.transport || {};
   const method = (options.method || 'GET').toUpperCase();
   const signedPath = buildSignedPath(pathname);
   const body = options.body ?? '';
@@ -376,10 +867,59 @@ async function apiFetch(pathname, options = {}) {
   headers.set('X-Auth-Timestamp', timestamp);
   headers.set('X-Auth-Nonce', nonce);
   headers.set('X-Auth-Signature', signature);
+  if (transport.relayAccessKey) {
+    const relayNonce = window.crypto.randomUUID();
+    const relayTimestamp = timestamp;
+    const relaySignature = await Crypto.hmac(
+      new TextEncoder().encode(transport.relayAccessKey),
+      [method, signedPath, relayTimestamp, relayNonce, bodyHash].join('\n')
+    );
+    headers.set('X-Relay-Access-Key-Id', 'default');
+    headers.set('X-Relay-Access-Timestamp', relayTimestamp);
+    headers.set('X-Relay-Access-Nonce', relayNonce);
+    headers.set('X-Relay-Access-Signature', relaySignature);
+  }
 
-  const response = await fetch(pathname, { ...options, method, headers });
+  const fetchOptions = { ...options };
+  delete fetchOptions.transport;
+
+  const response = await fetch(buildRequestUrl(pathname, transport.baseUrl), { ...fetchOptions, method, headers });
   await maybeHandleAuthFailure(response);
   return response;
+}
+
+function shouldFallbackFromRelay(response) {
+  return !response || [0, 401, 403, 408, 429, 500, 502, 503, 504].includes(response.status);
+}
+
+async function apiFetchWithDownloadStrategy(pathname, options = {}, { preferRelay = false } = {}) {
+  const relayBaseUrls = getUsableRelayBaseUrls();
+  if (preferRelay && relayBaseUrls.length > 0) {
+    if (!clientConfig.relayAccessKey && clientConfig.relayAccessKeyRequired) {
+      await loadTransportConfig();
+    }
+    const relayAccessKey = getRelayAccessKeyForDownload();
+    if (relayAccessKey || !clientConfig.relayAccessKeyRequired) {
+      for (const baseUrl of relayBaseUrls) {
+        try {
+          const relayResponse = await apiFetch(pathname, {
+            ...options,
+            transport: {
+              baseUrl,
+              relayAccessKey,
+            },
+          });
+          if (relayResponse.ok || !shouldFallbackFromRelay(relayResponse)) {
+            return relayResponse;
+          }
+          await relayResponse.body?.cancel?.();
+        } catch (err) {
+          console.warn(`TX relay failed (${baseUrl}), trying next route:`, err);
+        }
+      }
+    }
+  }
+  return apiFetch(pathname, options);
 }
 
 // ============ Screen and Timer Management ============
@@ -434,6 +974,7 @@ function showMainScreen() {
   showScreen('main-screen');
   loadFiles();
   loadTexts();
+  loadRelayStatus();
   if (fileRefreshTimer) clearInterval(fileRefreshTimer);
   fileRefreshTimer = setInterval(loadFiles, 10000);
   if (textRefreshTimer) clearInterval(textRefreshTimer);
@@ -524,6 +1065,7 @@ async function resetStoredSession(message = '本地配对已失效，请重新�
     encryptionKey = null;
     deviceId = null;
     deviceRecord = null;
+    clientConfig.relayAccessKey = '';
     allEntries = [];
     visibleEntries = [];
     loadedTexts = [];
@@ -634,6 +1176,7 @@ async function doPairing(pin) {
       name: chosenDeviceName,
       type: 'browser',
     };
+    await loadTransportConfig();
     elements.deviceSummary.textContent = chosenDeviceName;
     elements.deviceSummaryMeta.textContent = newDeviceId;
     setStatus('success', '配对成功');
@@ -886,7 +1429,7 @@ function updateFileSummary() {
 
   let summary = `${totalFiles.length} 个文件`;
   if (totalDirs > 0) summary += ` · ${totalDirs} 个文件夹`;
-  summary += ` · ${formatSize(totalSize)}`;
+  summary += ` · ${formatBytes(totalSize)}`;
   if (visibleEntries.length !== allEntries.length) {
     summary += ` · 当前显示 ${visibleFiles + visibleDirs} 项`;
   }
@@ -924,13 +1467,16 @@ function createFileItemMarkup(entry) {
   const typeKey = getEntryTypeKey(entry);
   const typeLabel = escapeHtml(getEntryTypeLabel(entry));
   const modifiedLabel = escapeHtml(formatEntryModified(entry));
-  const sizeLabel = isDir ? '—' : escapeHtml(formatSize(entry.size || 0));
+  const sizeLabel = isDir ? '—' : escapeHtml(formatBytes(entry.size || 0));
   const locationLabel = escapeHtml(parentPath || 'shared/');
   const actionMarkup = isDir
     ? `<button class="dir-action file-action-btn" type="button" data-dir-download="${escapedFullPath}" data-row-action-label>打包</button>`
-    : `<button class="dir-action file-action-btn" type="button" data-file-download="${escapedFullPath}" data-row-action-label>下载</button>`;
+    : `<button class="dir-action file-action-btn" type="button" data-file-download="${escapedFullPath}" data-row-action-label>下载</button>
+       <button class="share-action file-action-btn" type="button" data-file-share="${escapedFullPath}" title="分享链接">
+         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+       </button>`;
 
-  return `<li class="file-item${isDir ? ' dir-item' : ''}"${isDir ? ` data-dir="${escapedFullPath}"` : ` data-name="${escapedFullPath}"`}>
+  return `<li class="file-item${isDir ? ' dir-item' : ''}"${isDir ? ` data-dir="${escapedFullPath}"` : ` data-name="${escapedFullPath}"`} style="--download-progress:0%">
     ${isDir ? '' : `<input type="checkbox" class="file-checkbox" id="${checkboxId}">`}
     ${isDir ? '' : `<label for="${checkboxId}" class="file-checkbox-label">
       <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>
@@ -941,6 +1487,7 @@ function createFileItemMarkup(entry) {
         <div class="file-name">${escapedName}</div>
         <div class="file-meta">
           <span class="file-path">${locationLabel}</span>
+          <span class="file-meta-detail">${typeLabel} · ${sizeLabel}</span>
         </div>
       </div>
     </div>
@@ -1013,6 +1560,7 @@ function renderNextPage() {
   }
 
   syncRenderedSelection();
+  syncRenderedDownloads();
   isRenderingPage = false;
 }
 
@@ -1050,40 +1598,280 @@ async function loadFiles() {
   }
 }
 
+function findRelayBaseUrl(protocol) {
+  return getRelayBaseUrls().find((entry) => {
+    try {
+      return new URL(entry).protocol === protocol;
+    } catch {
+      return false;
+    }
+  }) || '';
+}
+
+async function probeRelayHealth(baseUrl) {
+  if (!baseUrl) return { ok: false, reason: '未配置' };
+  try {
+    const response = await fetch(`${baseUrl}/__relay/healthz`, {
+      cache: 'no-store',
+      mode: 'cors',
+    });
+    if (!response.ok) return { ok: false, reason: `HTTP ${response.status}` };
+    const data = await response.json().catch(() => ({}));
+    return { ok: data.ok === true, reason: data.ok === true ? '' : '响应异常' };
+  } catch (err) {
+    return { ok: false, reason: err && err.name ? err.name : '连接失败' };
+  }
+}
+
+async function loadRelayStatus() {
+  const card = document.getElementById('cloud-card');
+  if (!card) return;
+
+  const httpsUrl = findRelayBaseUrl('https:');
+  const httpUrl = findRelayBaseUrl('http:');
+  if (!httpUrl) {
+    card.style.display = 'none';
+    return;
+  }
+
+  const httpText = document.getElementById('cloud-traffic-text');
+  const httpMeta = document.getElementById('cloud-traffic-meta');
+  const httpLabel = document.getElementById('cloud-traffic-label');
+
+  try {
+    if (normalizeBaseUrl(localStorage.getItem(PREFERRED_RELAY_BASE_URL_KEY)) === httpUrl) {
+      card.style.display = 'none';
+      return;
+    }
+  } catch {}
+
+  card.style.display = 'none';
+
+  if (httpsUrl) {
+    const httpsStatus = await probeRelayHealth(httpsUrl);
+    if (httpsStatus.ok) return;
+  }
+
+  const httpStatus = await probeRelayHealth(httpUrl);
+  try {
+    if (httpStatus.ok && httpUrl) {
+      localStorage.setItem(PREFERRED_RELAY_BASE_URL_KEY, httpUrl);
+      card.style.display = 'none';
+      return;
+    }
+  } catch {}
+
+  card.style.display = '';
+  if (httpLabel) httpLabel.textContent = 'HTTPS relay 当前不可用，Chrome 需要允许 HTTP relay';
+  if (httpText) httpText.textContent = '需配置';
+  if (httpMeta) {
+    httpMeta.textContent = `操作：打开 chrome://flags/#unsafely-treat-insecure-origin-as-secure，在 Insecure origins treated as secure 中添加 ${httpUrl}，点击 Relaunch 重启 Chrome，然后刷新本页。配置成功后会自动记住并隐藏此提示。`;
+  }
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
 function setRowActionLabel(element, label) {
   const actionLabel = element?.querySelector('[data-row-action-label]');
   if (actionLabel) actionLabel.textContent = label;
 }
 
-async function downloadFile(name, element) {
-  if (element?.classList.contains('downloading')) return;
-  if (element) {
-    element.classList.add('downloading');
-    setRowActionLabel(element, '解密中');
-  }
-
-  try {
-    const encodedPath = name.split('/').map(encodeURIComponent).join('/');
-    const response = await apiFetch(`/api/files/${encodedPath}`);
-    if (!response.ok) throw new Error('Download failed');
-    const { filename, plainBuf } = await decryptDownloadResponse(response);
-    downloadBuffer(filename || name.split('/').pop(), plainBuf);
-    toast(`${name.split('/').pop()} 下载完成`, 'ok');
-  } catch (error) {
-    toast(`下载失败: ${error.message}`, 'err');
-  } finally {
-    if (element) {
-      element.classList.remove('downloading');
-      setRowActionLabel(element, '下载');
+function setRowDownloadProgress(element, received = 0, total = 0, label = '') {
+  if (!element) return;
+  element.classList.add('downloading');
+  if (Number.isFinite(total) && total > 0) {
+    if (!(Number.isFinite(received) && received > 0)) {
+      element.classList.add('download-indeterminate');
+      element.style.setProperty('--download-progress', '32%');
+      setRowActionLabel(element, label || '下载中');
+      return;
     }
+    const pct = Math.max(0, Math.min(100, (received / total) * 100));
+    element.classList.remove('download-indeterminate');
+    element.style.setProperty('--download-progress', `${pct.toFixed(2)}%`);
+    setRowActionLabel(element, label || `${pct.toFixed(0)}%`);
+    return;
+  }
+  element.classList.add('download-indeterminate');
+  element.style.setProperty('--download-progress', '32%');
+  setRowActionLabel(element, label || (received > 0 ? `已下载 ${formatBytes(received)}` : '下载中'));
+}
+
+function resetRowDownloadProgress(element) {
+  if (!element) return;
+  element.classList.remove('downloading', 'download-indeterminate');
+  element.style.setProperty('--download-progress', '0%');
+}
+
+function findRenderedDownloadRow(name, isDir = false) {
+  const attr = isDir ? 'data-dir' : 'data-name';
+  return Array.from(elements.fileList.querySelectorAll(`.file-item[${attr}]`))
+    .find((item) => item.getAttribute(attr) === name) || null;
+}
+
+function updateDownloadState(name, patch, { isDir = false } = {}) {
+  if (!name) return;
+  const state = {
+    received: 0,
+    total: 0,
+    label: isDir ? '打包中' : '下载中',
+    isDir,
+    ...(activeRowDownloads.get(name) || {}),
+    ...patch,
+  };
+  activeRowDownloads.set(name, state);
+  const row = findRenderedDownloadRow(name, state.isDir);
+  if (row) setRowDownloadProgress(row, state.received, state.total, state.label);
+}
+
+function clearDownloadState(name) {
+  if (!name) return;
+  const state = activeRowDownloads.get(name);
+  activeRowDownloads.delete(name);
+  const row = findRenderedDownloadRow(name, Boolean(state?.isDir));
+  if (row) {
+    resetRowDownloadProgress(row);
+    setRowActionLabel(row, state?.isDir ? '打包' : '下载');
   }
 }
 
-async function downloadArchive(paths, fallbackName) {
-  const response = await apiFetch('/api/archive', {
+function syncRenderedDownloads() {
+  for (const [name, state] of activeRowDownloads.entries()) {
+    const row = findRenderedDownloadRow(name, state.isDir);
+    if (row) setRowDownloadProgress(row, state.received, state.total, state.label);
+  }
+}
+
+function updateToggleHint(el, singleUse) {
+  el.textContent = singleUse ? '· 单次分享' : '· 多次分享';
+  el.className = 'share-toggle-hint' + (singleUse ? '' : ' multi');
+}
+
+async function createShareLink(filePath) {
+  try {
+    const response = await apiFetch('/api/share/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: filePath }),
+    });
+    if (!response.ok) {
+      const json = await response.json().catch(() => ({}));
+      throw new Error(json.error || 'Failed to create share link');
+    }
+    const { url } = await response.json();
+    showShareModal(filePath.split('/').pop(), url);
+  } catch (err) {
+    toast(`创建分享链接失败: ${err.message}`, 'err');
+  }
+}
+
+function showShareModal(filename, url) {
+  const modal = document.getElementById('share-modal');
+  const nameEl = document.getElementById('share-modal-filename');
+  const input = document.getElementById('share-link-input');
+  const copyBtn = document.getElementById('share-copy-btn');
+  const closeBtn = document.getElementById('share-close-btn');
+  if (!modal || !nameEl || !input) return;
+
+  nameEl.textContent = filename;
+  input.value = url;
+  modal.style.display = 'flex';
+
+  const onCopy = () => {
+    navigator.clipboard.writeText(url).then(() => toast('链接已复制', 'ok')).catch(() => toast('复制失败，请手动复制', 'err'));
+  };
+  const onClose = () => { modal.style.display = 'none'; };
+  const onOutside = (e) => { if (e.target === modal) onClose(); };
+
+  copyBtn.onclick = onCopy;
+  closeBtn.onclick = onClose;
+  modal.onclick = onOutside;
+}
+
+async function downloadFile(name, element) {
+  if (activeRowDownloads.has(name) || element?.classList.contains('downloading')) return;
+  updateDownloadState(name, { label: '准备下载' });
+
+  try {
+    const encodedPath = name.split('/').map(encodeURIComponent).join('/');
+    const entry = findFileEntry(name);
+    const expectedSize = Number(entry?.size) || 0;
+    const response = await apiFetchWithDownloadStrategy(`/api/files/${encodedPath}`, {}, {
+      preferRelay: shouldPreferRelay(expectedSize),
+    });
+    if (!response.ok) throw new Error('Download failed');
+    const result = await decryptDownloadResponse(response, {
+      onProgress: (received) => {
+        const receivedPlain = expectedSize > 0 ? Math.min(received, expectedSize) : received;
+        updateDownloadState(name, {
+          received: receivedPlain,
+          total: expectedSize,
+          label: expectedSize > 0
+            ? `${Math.min(100, (receivedPlain / expectedSize) * 100).toFixed(0)}%`
+            : `已下载 ${formatBytes(receivedPlain)}`,
+        });
+      },
+    });
+    const filename = result.filename || name.split('/').pop();
+
+    if (result.isStream) {
+      const progressTotal = Number(result.totalSize || expectedSize || 0);
+      updateDownloadState(name, { received: 0, total: progressTotal, label: '下载中' });
+      const { saved, bytes } = await streamDownloadToFile(
+        result.stream,
+        filename,
+        (received) => {
+          updateDownloadState(name, {
+            received,
+            total: progressTotal,
+            label: progressTotal > 0
+              ? `${Math.min(100, (received / progressTotal) * 100).toFixed(0)}%`
+              : `已下载 ${formatBytes(received)}`,
+          });
+        }
+      );
+      if (saved) {
+        if (progressTotal > 0) {
+          updateDownloadState(name, { received: progressTotal, total: progressTotal, label: '100%' });
+          await delay(250);
+        }
+        toast(`${filename} 下载完成 (${formatBytes(bytes || 0)})`, 'ok');
+      }
+    } else {
+      updateDownloadState(name, {
+        received: result.plainBuf.length,
+        total: result.plainBuf.length,
+        label: '解密中',
+      });
+      downloadBuffer(filename, result.plainBuf);
+      updateDownloadState(name, {
+        received: result.plainBuf.length,
+        total: result.plainBuf.length,
+        label: '100%',
+      });
+      await delay(250);
+      toast(`${filename} 下载完成`, 'ok');
+    }
+  } catch (error) {
+    toast(`下载失败: ${error.message}`, 'err');
+  } finally {
+    clearDownloadState(name);
+  }
+}
+
+async function downloadArchive(paths, fallbackName, { onProgress } = {}) {
+  const totalSize = getEntriesTotalSize(paths);
+  const response = await apiFetchWithDownloadStrategy('/api/archive', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ paths }),
+  }, {
+    preferRelay: shouldPreferRelay(totalSize),
   });
   if (!response.ok) {
     const body = await response.text();
@@ -1095,26 +1883,33 @@ async function downloadArchive(paths, fallbackName) {
     }
     throw new Error(errorMessage);
   }
-  const { filename, plainBuf } = await decryptDownloadResponse(response);
-  downloadBuffer(filename || fallbackName, plainBuf);
+  const result = await decryptDownloadResponse(response, { onProgress });
+  const filename = result.filename || fallbackName;
+  if (result.isStream) {
+    await streamDownloadToFile(result.stream, filename, onProgress);
+  } else {
+    downloadBuffer(filename, result.plainBuf);
+  }
 }
 
 async function downloadDirectory(dirName, element) {
-  if (element?.classList.contains('downloading')) return;
-  if (element) {
-    element.classList.add('downloading');
-    setRowActionLabel(element, '打包中');
-  }
+  if (activeRowDownloads.has(dirName) || element?.classList.contains('downloading')) return;
+  updateDownloadState(dirName, { label: '打包中' }, { isDir: true });
   try {
-    await downloadArchive([dirName], `${dirName.split('/').pop() || 'folder'}.tar.gz`);
+    await downloadArchive([dirName], `${dirName.split('/').pop() || 'folder'}.tar.gz`, {
+      onProgress: (received) => {
+        updateDownloadState(dirName, {
+          received,
+          total: 0,
+          label: `已下载 ${formatBytes(received)}`,
+        }, { isDir: true });
+      },
+    });
     toast(`${dirName.split('/').pop()} 已打包下载`, 'ok');
   } catch (error) {
     toast(`目录下载失败: ${error.message}`, 'err');
   } finally {
-    if (element) {
-      element.classList.remove('downloading');
-      setRowActionLabel(element, '打包');
-    }
+    clearDownloadState(dirName);
   }
 }
 
@@ -1329,6 +2124,13 @@ function setupEventListeners() {
       return;
     }
 
+    const shareButton = event.target.closest('[data-file-share]');
+    if (shareButton) {
+      event.stopPropagation();
+      createShareLink(shareButton.getAttribute('data-file-share'));
+      return;
+    }
+
     const checkbox = event.target.closest('.file-checkbox, .file-checkbox-label');
     if (checkbox) {
       const row = checkbox.closest('.file-item');
@@ -1360,6 +2162,7 @@ function setupEventListeners() {
 // ============ Init ============
 
 async function init() {
+  await loadClientConfig();
   setupPinInputs();
   setupEventListeners();
 
@@ -1377,6 +2180,7 @@ async function init() {
       if (sessionResponse.ok) {
         const session = await sessionResponse.json();
         deviceRecord = session.device;
+        await loadTransportConfig();
         elements.deviceSummary.textContent = session.device?.name || storedDeviceName || storedDeviceId;
         elements.deviceSummaryMeta.textContent = session.device?.id || storedDeviceId;
         showMainScreen();

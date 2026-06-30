@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 const crypto = require('crypto');
 const fs = require('fs');
 const net = require('net');
@@ -24,12 +23,10 @@ function getFreePort() {
 async function waitForHealth(url, child, timeoutMs, getLogs) {
   const deadline = Date.now() + timeoutMs;
   let lastError = null;
-
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
       throw new Error(`Server exited early with code ${child.exitCode}\n${getLogs()}`);
     }
-
     try {
       const response = await fetch(url);
       if (!response.ok) {
@@ -40,10 +37,8 @@ async function waitForHealth(url, child, timeoutMs, getLogs) {
     } catch (error) {
       lastError = error;
     }
-
     await delay(250);
   }
-
   throw lastError || new Error(`Timed out waiting for ${url}`);
 }
 
@@ -80,22 +75,11 @@ function decryptAesGcm(key, encrypted) {
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
-function assertNoPlainRelayAccessKey(data, expectedKey) {
-  const serialized = JSON.stringify(data);
-  if (serialized.includes(expectedKey)) {
-    throw new Error('transport config leaked plaintext relay access key');
-  }
-}
-
 async function requestJson(url, options = {}) {
   const response = await fetch(url, options);
   const text = await response.text();
   let data = {};
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    data = {};
-  }
+  try { data = text ? JSON.parse(text) : {}; } catch {}
   if (!response.ok) {
     throw new Error(`${options.method || 'GET'} ${url} -> ${response.status}\n${text}`);
   }
@@ -124,7 +108,6 @@ async function pair(baseUrl, pin) {
   const authKey = hkdf(sharedSecret, 'syncd-auth', 'pin-verify', 32);
   const proof = hmac(authKey, pin);
   const deviceId = 'test-device';
-
   const verify = await requestJson(`${baseUrl}/api/pair/verify`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -132,28 +115,27 @@ async function pair(baseUrl, pin) {
       clientPublicKey: ecdh.getPublicKey('hex'),
       proof,
       deviceId,
-      deviceName: 'Integration Test',
+      deviceName: 'Chunked Test',
       deviceType: 'node',
     }),
   });
-
   const expectedServerProof = hmac(authKey, 'server-confirmed');
-  if (verify.serverProof !== expectedServerProof) {
-    throw new Error('Server proof mismatch');
-  }
-
+  if (verify.serverProof !== expectedServerProof) throw new Error('Server proof mismatch');
   const transportKey = hkdf(sharedSecret, 'syncd-transport', 'master-key-delivery', 32);
   const masterKey = decryptAesGcm(transportKey, verify.encryptedMasterKey);
   return { deviceId, masterKey };
 }
 
 async function main() {
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cloudsysncd-integration-'));
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'syncd-chunked-test-'));
   const dataDir = path.join(tempRoot, 'data');
   const sharedDir = path.join(tempRoot, 'shared');
-  fs.mkdirSync(path.join(sharedDir, 'docs'), { recursive: true });
-  fs.writeFileSync(path.join(sharedDir, 'alpha.txt'), 'hello alpha\n');
-  fs.writeFileSync(path.join(sharedDir, 'docs', 'note.txt'), 'nested\n');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(sharedDir, { recursive: true });
+
+  const fileSize = 5 * 1024 * 1024;
+  const original = crypto.randomBytes(fileSize);
+  fs.writeFileSync(path.join(sharedDir, 'large.bin'), original);
 
   const port = await getFreePort();
   const logs = [];
@@ -164,9 +146,8 @@ async function main() {
       PORT: String(port),
       DATA_DIR: dataDir,
       SHARED_DIR: sharedDir,
-      PAIR_SESSION_TTL_MS: '1000',
-      CLIENT_PRIMARY_RELAY_URL: 'https://relay.example.test',
-      CLIENT_RELAY_ACCESS_KEY: 'integration-relay-access-key',
+      PAIR_SESSION_TTL_MS: '10000',
+      CHUNKED_THRESHOLD_BYTES: '1048576',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -177,96 +158,56 @@ async function main() {
   try {
     const baseUrl = `http://127.0.0.1:${port}`;
     const health = await waitForHealth(`${baseUrl}/healthz`, child, 10000, getLogs);
-    if (!health.ok || !health.pendingPairExpiresAt) {
-      throw new Error(`Unexpected health payload: ${JSON.stringify(health)}`);
-    }
-
-    await delay(1200);
-    const expiredStatus = await requestJson(`${baseUrl}/api/pair/status`);
-    if (expiredStatus.active) {
-      throw new Error('Pairing session should expire during integration test');
-    }
-
     const adminToken = fs.readFileSync(path.join(dataDir, '.admin-token'), 'utf8').trim();
-    const newPin = await requestJson(`${baseUrl}/api/local/new-pin`, {
+    const { pin } = await requestJson(`${baseUrl}/api/local/new-pin`, {
       method: 'POST',
       headers: { 'x-admin-token': adminToken },
     });
-    if (!newPin.pin || !newPin.expiresAt) {
-      throw new Error('Expected admin new-pin response to include pin and expiresAt');
-    }
+    const { deviceId, masterKey } = await pair(baseUrl, pin);
 
-    const { deviceId, masterKey } = await pair(baseUrl, newPin.pin);
-    const sessionHeaders = buildAuthHeaders('GET', '/api/session', Buffer.alloc(0), masterKey, deviceId);
-    const sessionResponse = await fetch(`${baseUrl}/api/session`, { headers: sessionHeaders });
-    const session = await sessionResponse.json();
-    if (!sessionResponse.ok || session.device?.name !== 'Integration Test') {
-      throw new Error(`Unexpected session payload: ${JSON.stringify(session)}`);
-    }
+    const headers = buildAuthHeaders('GET', '/api/files/large.bin', Buffer.alloc(0), masterKey, deviceId);
+    const response = await fetch(`${baseUrl}/api/files/large.bin`, { headers });
+    if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+    const format = response.headers.get('x-encryption-format');
+    if (format !== 'chunked-aead-v1') throw new Error(`Expected chunked-aead-v1, got ${format}`);
 
-    const transportHeaders = buildAuthHeaders('GET', '/api/transport-config', Buffer.alloc(0), masterKey, deviceId);
-    const transportResponse = await fetch(`${baseUrl}/api/transport-config`, { headers: transportHeaders });
-    const transportConfig = await transportResponse.json();
-    if (!transportResponse.ok) {
-      throw new Error(`Unexpected transport config response: ${JSON.stringify(transportConfig)}`);
+    const chunks = [];
+    for await (const data of response.body) {
+      chunks.push(data);
     }
-    assertNoPlainRelayAccessKey(transportConfig, 'integration-relay-access-key');
-    if (transportConfig.relayAccessKey !== undefined || !transportConfig.encryptedRelayAccessKey) {
-      throw new Error(`Expected encrypted relay access key only: ${JSON.stringify(transportConfig)}`);
-    }
-    const relayPayload = JSON.parse(decryptAesGcm(masterKey, transportConfig.encryptedRelayAccessKey).toString('utf8'));
-    if (relayPayload.relayAccessKey !== 'integration-relay-access-key' || relayPayload.authScheme !== 'hmac-v1') {
-      throw new Error(`Unexpected relay transport payload: ${JSON.stringify(relayPayload)}`);
-    }
+    const encrypted = Buffer.concat(chunks);
 
-    const devices = await requestJson(`${baseUrl}/api/local/devices`, {
-      headers: { 'x-admin-token': adminToken },
-    });
-    const listed = devices.devices.find((entry) => entry.id === deviceId);
-    if (!listed || listed.name !== 'Integration Test') {
-      throw new Error(`Device list missing paired device: ${JSON.stringify(devices)}`);
+    if (encrypted[0] !== 0x53 || encrypted[1] !== 0x59 || encrypted[2] !== 0x4E || encrypted[3] !== 0x43) {
+      throw new Error('Invalid magic');
     }
+    const chunkSize = (encrypted[5] << 24) | (encrypted[6] << 16) | (encrypted[7] << 8) | encrypted[8];
+    console.log(`Chunk size: ${chunkSize}`);
 
-    const archiveBody = Buffer.from(JSON.stringify({ paths: ['alpha.txt', 'docs'] }));
-    const archiveHeaders = {
-      'Content-Type': 'application/json',
-      ...buildAuthHeaders('POST', '/api/archive', archiveBody, masterKey, deviceId),
-    };
-    const archiveResponse = await fetch(`${baseUrl}/api/archive`, {
-      method: 'POST',
-      headers: archiveHeaders,
-      body: archiveBody,
-    });
-    if (!archiveResponse.ok) {
-      throw new Error(`Archive request failed with ${archiveResponse.status}`);
+    let offset = 16;
+    const decryptedChunks = [];
+    while (offset < encrypted.length) {
+      const iv = encrypted.subarray(offset, offset + 12);
+      offset += 12;
+      const len = (encrypted[offset] << 24) | (encrypted[offset + 1] << 16) | (encrypted[offset + 2] << 8) | encrypted[offset + 3];
+      offset += 4;
+      const ciphertext = encrypted.subarray(offset, offset + len);
+      offset += len;
+      const tag = encrypted.subarray(offset, offset + 16);
+      offset += 16;
+      const decipher = crypto.createDecipheriv('aes-256-gcm', masterKey, iv);
+      decipher.setAuthTag(tag);
+      decryptedChunks.push(Buffer.concat([decipher.update(ciphertext), decipher.final()]));
     }
-    if (archiveResponse.headers.get('x-archive-count') !== '2') {
-      throw new Error(`Unexpected archive headers: ${archiveResponse.headers.get('x-archive-count')}`);
-    }
-    const archiveBytes = await archiveResponse.arrayBuffer();
-    if (archiveBytes.byteLength === 0) {
-      throw new Error('Archive response was empty');
-    }
-
-    await requestJson(`${baseUrl}/api/local/devices/${deviceId}`, {
-      method: 'DELETE',
-      headers: { 'x-admin-token': adminToken },
-    });
-
-    const revokedHeaders = buildAuthHeaders('GET', '/api/session', Buffer.alloc(0), masterKey, deviceId);
-    const revokedResponse = await fetch(`${baseUrl}/api/session`, { headers: revokedHeaders });
-    if (revokedResponse.status !== 401) {
-      throw new Error(`Expected revoked device to fail with 401, got ${revokedResponse.status}`);
-    }
-
-    console.log(`Integration test passed on port ${port}`);
+    const decrypted = Buffer.concat(decryptedChunks);
+    if (!decrypted.equals(original)) throw new Error('Decrypted content mismatch');
+    console.log(`Chunked download test passed: ${decrypted.length} bytes`);
   } finally {
     await stopChild(child);
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 }
 
-main().catch((error) => {
-  console.error(error.message || error);
+main().catch((err) => {
+  console.error(err.message || err);
   process.exit(1);
 });
