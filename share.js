@@ -37,6 +37,7 @@ const dataDir = resolveDataDir();
 const repoSharedSourceDir = path.resolve(path.join(__dirname, 'shared'));
 
 const storage = require('./lib/cloud-storage');
+const sharedLinks = require('./lib/shared-links');
 
 function loadMasterKey() {
   try {
@@ -137,6 +138,7 @@ if (args.length === 0) {
   const displayDir = path.relative(process.cwd(), sharedDir) || '.';
   console.log('用法:');
   console.log(`  node share.js file1.pdf dir/ file2.txt  — 复制到 ${displayDir}/`);
+  console.log(`  node share.js --link file1 dir/ ...     — 以符号链接挂到 ${displayDir}/(不复制、不上传云端)`);
   console.log('  node share.js --list                    — 列出共享文件');
   console.log(`  node share.js --clear                   — 清空 ${displayDir}/`);
   process.exit(0);
@@ -148,19 +150,40 @@ if (args[0] === '--list') {
     console.log(`${path.relative(process.cwd(), sharedDir) || '.'}/ 目录为空`);
     process.exit(0);
   }
+  const registry = sharedLinks.loadRegistry(dataDir);
   const walk = (dir, prefix = '') => {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
       if (e.name.startsWith('.')) continue;
       const rel = prefix ? `${prefix}/${e.name}` : e.name;
       if (isHiddenSharedRelPath(rel)) continue;
+      const full = path.join(dir, e.name);
       if (e.isSymbolicLink()) {
-        console.warn(`  跳过符号链接: ${rel}`);
+        // 顶层已登记链接正常显示并跟随,其余符号链接保持跳过
+        const target = prefix === '' ? sharedLinks.getRegisteredTarget(registry, e.name) : null;
+        if (!target) {
+          console.warn(`  跳过符号链接: ${rel}`);
+          continue;
+        }
+        let linkStat = null;
+        try {
+          linkStat = fs.statSync(full);
+        } catch {
+          linkStat = null;
+        }
+        if (linkStat && linkStat.isDirectory()) {
+          console.log(`  ${rel} -> ${target} (链接)`);
+          walk(full, rel);
+        } else if (linkStat && linkStat.isFile()) {
+          console.log(`  ${rel} -> ${target} (链接, ${formatSize(linkStat.size)})`);
+        } else {
+          console.log(`  ${rel} -> ${target} (链接, 目标缺失)`);
+        }
         continue;
       }
       if (e.isDirectory()) {
-        walk(path.join(dir, e.name), rel);
+        walk(full, rel);
       } else {
-        const sz = fs.statSync(path.join(dir, e.name)).size;
+        const sz = fs.statSync(full).size;
         console.log(`  ${rel}  (${formatSize(sz)})`);
       }
     }
@@ -175,13 +198,88 @@ if (args[0] === '--clear') {
     for (const entry of fs.readdirSync(sharedDir, { withFileTypes: true })) {
       if (entry.name.startsWith('.')) continue;
       if (isProtectedSharedRelPath(entry.name)) continue;
+      // rmSync 作用于符号链接本身,不会跟随删除目标
       fs.rmSync(path.join(sharedDir, entry.name), { recursive: true, force: true });
     }
   }
   fs.mkdirSync(sharedDir, { recursive: true });
+  // 同步清空软链接登记文件
+  sharedLinks.saveRegistryAtomic(dataDir, {});
   scheduleCloudClear();
   console.log(`${path.relative(process.cwd(), sharedDir) || '.'}/ 已清空`);
   process.exit(0);
+}
+
+// --link: symlink external files/dirs into shared/ and register them
+if (args[0] === '--link') {
+  const sources = args.slice(1);
+  if (sources.length === 0) {
+    console.error('用法: node share.js --link <文件或目录> [更多路径...]');
+    process.exit(1);
+  }
+  fs.mkdirSync(sharedDir, { recursive: true });
+  const registry = sharedLinks.loadRegistry(dataDir);
+  let count = 0;
+  let failed = false;
+
+  for (const src of sources) {
+    const resolved = path.resolve(src);
+    if (!fs.existsSync(resolved)) {
+      console.error(`  跳过: ${src} (不存在)`);
+      continue;
+    }
+    const stat = fs.lstatSync(resolved);
+    if (stat.isSymbolicLink()) {
+      console.error(`  跳过: ${src} (源本身是符号链接,不允许共享)`);
+      continue;
+    }
+    const realTarget = fs.realpathSync(resolved);
+    const baseName = path.basename(resolved);
+    const dest = path.join(sharedDir, baseName);
+
+    let existing = null;
+    try {
+      existing = fs.lstatSync(dest);
+    } catch {
+      existing = null;
+    }
+    if (existing) {
+      console.error(`  跳过: ${baseName} (共享目录中已存在同名条目)`);
+      continue;
+    }
+
+    const isDir = stat.isDirectory();
+    // Windows 目录用 junction(无需管理员权限,要求绝对路径),文件用默认 symlink
+    const linkType = process.platform === 'win32'
+      ? (isDir ? 'junction' : 'file')
+      : (isDir ? 'dir' : 'file');
+    try {
+      fs.symlinkSync(realTarget, dest, linkType);
+    } catch (err) {
+      failed = true;
+      if (err && ['EPERM', 'EACCES', 'ENOTSUP'].includes(err.code)) {
+        console.error(`  失败: ${baseName} (创建符号链接被拒绝: ${err.code})`);
+        if (process.platform === 'win32' && !isDir) {
+          console.error('  提示: Windows 创建文件符号链接需要管理员权限或开发者模式,可改用复制模式: node share.js <文件>');
+        } else {
+          console.error('  提示: 当前环境不允许创建符号链接,可改用复制模式: node share.js <路径>');
+        }
+      } else {
+        console.error(`  失败: ${baseName} (${err && err.message ? err.message : err})`);
+      }
+      continue;
+    }
+
+    registry[baseName] = realTarget;
+    console.log(`  + ${baseName} -> ${realTarget} (链接)`);
+    count++;
+  }
+
+  if (count > 0) {
+    sharedLinks.saveRegistryAtomic(dataDir, registry);
+  }
+  console.log(`共创建 ${count} 个链接到 ${path.relative(process.cwd(), sharedDir) || '.'}/(链接项不调度云上传)`);
+  process.exit(failed ? 1 : 0);
 }
 
 // Copy files/dirs to shared/

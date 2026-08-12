@@ -9,6 +9,7 @@ const tar = require('tar');
 const packageJson = require('./package.json');
 const storage = require('./lib/cloud-storage');
 const chunkedAead = require('./lib/chunked-aead');
+const sharedLinks = require('./lib/shared-links');
 
 const app = express();
 app.disable('x-powered-by');
@@ -107,6 +108,20 @@ const seenRequestNonces = new Map();
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const sharedDir = path.resolve(process.env.SHARED_DIR || path.join(__dirname, 'shared'));
+// 已登记软链接白名单(data/shared-links.json),带 mtime 缓存
+const readSharedLinkRegistry = sharedLinks.createCachedRegistryReader(DATA_DIR);
+
+function getRegisteredLinkTarget(topName) {
+  return sharedLinks.getRegisteredTarget(readSharedLinkRegistry(), topName);
+}
+
+// realpath 逃出 sharedDir 时,仅当第一段是已登记链接名且 realFullPath 在登记目标内才放行
+function isRegisteredLinkEscapeAllowed(normalizedRelPath, realFullPath) {
+  const topName = String(normalizedRelPath || '').split('/')[0];
+  const target = getRegisteredLinkTarget(topName);
+  if (!target) return false;
+  return sharedLinks.isRealPathWithinTarget(realFullPath, target);
+}
 const repoSharedSourceDir = path.resolve(path.join(__dirname, 'shared'));
 const HIDDEN_SHARED_RELATIVE_PATHS = new Set(
   sharedDir === repoSharedSourceDir ? ['sync_download.py', '__pycache__'] : []
@@ -860,7 +875,22 @@ function walkDir(dir, prefix = '') {
     const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
     if (isInternalSharedRelPath(relPath)) continue;
     const fullPath = path.join(dir, entry.name);
-    if (entry.isSymbolicLink()) continue;
+    if (entry.isSymbolicLink()) {
+      // 仅放行 sharedDir 顶层已登记的链接,其余符号链接照旧排除
+      if (prefix !== '') continue;
+      const linkTarget = getRegisteredLinkTarget(entry.name);
+      if (!linkTarget) continue;
+      const realLinkPath = getRealPathIfExists(fullPath);
+      if (!realLinkPath || !sharedLinks.isRealPathWithinTarget(realLinkPath, linkTarget)) continue;
+      const linkStat = fs.statSync(fullPath);
+      if (linkStat.isDirectory()) {
+        results.push({ name: relPath, type: 'dir', modified: linkStat.mtime.toISOString() });
+        results = results.concat(walkDir(fullPath, relPath));
+      } else if (linkStat.isFile()) {
+        results.push({ name: relPath, type: 'file', size: linkStat.size, modified: linkStat.mtime.toISOString() });
+      }
+      continue;
+    }
     const stat = fs.statSync(fullPath);
     if (entry.isDirectory()) {
       results.push({ name: relPath, type: 'dir', modified: stat.mtime.toISOString() });
@@ -883,7 +913,8 @@ function resolveSharedEntry(relPath) {
 
   const realSharedDir = getRealPathIfExists(sharedDir) || path.resolve(sharedDir);
   const realFullPath = getRealPathIfExists(fullPath);
-  if (realFullPath && !isPathInside(realSharedDir, realFullPath)) return null;
+  if (realFullPath && !isPathInside(realSharedDir, realFullPath)
+    && !isRegisteredLinkEscapeAllowed(normalized, realFullPath)) return null;
 
   return { relPath: normalized, fullPath: realFullPath || fullPath };
 }
@@ -1124,7 +1155,7 @@ app.post('/api/archive', requireDeviceAuth, async (req, res) => {
   activeDownloads++;
   streamEncryptedResponse({
     res,
-    sourceStream: tar.create({ gzip: true, cwd: sharedDir }, archive.paths),
+    sourceStream: tar.create({ gzip: true, follow: true, cwd: sharedDir }, archive.paths),
     label: 'ARCHIVE',
     extraHeaders: {
       'X-File-Name': encodeURIComponent('selected.tar.gz'),
@@ -1171,7 +1202,7 @@ app.get('/api/batch', requireDeviceAuth, (req, res) => {
   activeDownloads++;
   streamEncryptedResponse({
     res,
-    sourceStream: tar.create({ gzip: true, cwd: sharedDir }, files),
+    sourceStream: tar.create({ gzip: true, follow: true, cwd: sharedDir }, files),
     label: 'BATCH',
     extraHeaders: {
       'X-Batch-Count': String(files.length),
