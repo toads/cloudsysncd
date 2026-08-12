@@ -80,6 +80,22 @@ function decryptAesGcm(key, encrypted) {
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
+// 单文件下载:body 为 AES-256-GCM 密流,末尾 16 字节为 tag,IV 在响应头
+async function downloadPlainFile(baseUrl, requestPath, masterKey, deviceId) {
+  const headers = buildAuthHeaders('GET', requestPath, Buffer.alloc(0), masterKey, deviceId);
+  const response = await fetch(`${baseUrl}${requestPath}`, { headers });
+  if (!response.ok) {
+    throw new Error(`GET ${requestPath} -> ${response.status}`);
+  }
+  const iv = Buffer.from(response.headers.get('x-encrypted-iv'), 'hex');
+  const body = Buffer.from(await response.arrayBuffer());
+  const tag = body.subarray(body.length - 16);
+  const ciphertext = body.subarray(0, body.length - 16);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', masterKey, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
 function assertNoPlainRelayAccessKey(data, expectedKey) {
   const serialized = JSON.stringify(data);
   if (serialized.includes(expectedKey)) {
@@ -155,6 +171,32 @@ async function main() {
   fs.writeFileSync(path.join(sharedDir, 'alpha.txt'), 'hello alpha\n');
   fs.writeFileSync(path.join(sharedDir, 'docs', 'note.txt'), 'nested\n');
 
+  // 软链接分享夹具:在 shared 外准备文件/目录,以与 share.js --link 相同的方式创建链接并写登记
+  const externalDir = path.join(tempRoot, 'external');
+  fs.mkdirSync(path.join(externalDir, 'ext-dir'), { recursive: true });
+  fs.writeFileSync(path.join(externalDir, 'ext-file.txt'), 'linked external file\n');
+  fs.writeFileSync(path.join(externalDir, 'ext-dir', 'inner.txt'), 'linked inner\n');
+  fs.writeFileSync(path.join(externalDir, 'secret.txt'), 'unregistered secret\n');
+
+  let linksAvailable = true;
+  try {
+    const realFile = fs.realpathSync(path.join(externalDir, 'ext-file.txt'));
+    const realDir = fs.realpathSync(path.join(externalDir, 'ext-dir'));
+    const realSecret = fs.realpathSync(path.join(externalDir, 'secret.txt'));
+    fs.symlinkSync(realFile, path.join(sharedDir, 'linked-file.txt'), 'file');
+    fs.symlinkSync(realDir, path.join(sharedDir, 'linked-dir'), process.platform === 'win32' ? 'junction' : 'dir');
+    // 未登记的越界符号链接:必须保持不可见、不可下载
+    fs.symlinkSync(realSecret, path.join(sharedDir, 'secret-link.txt'), 'file');
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, 'shared-links.json'), JSON.stringify({
+      'linked-file.txt': realFile,
+      'linked-dir': realDir,
+    }, null, 2));
+  } catch (err) {
+    linksAvailable = false;
+    console.log(`Skipping shared-link cases (symlink unavailable: ${(err && err.code) || err})`);
+  }
+
   const port = await getFreePort();
   const logs = [];
   const child = spawn(path.resolve(__dirname, '..', 'start.sh'), [], {
@@ -225,6 +267,64 @@ async function main() {
     const listed = devices.devices.find((entry) => entry.id === deviceId);
     if (!listed || listed.name !== 'Integration Test') {
       throw new Error(`Device list missing paired device: ${JSON.stringify(devices)}`);
+    }
+
+    if (linksAvailable) {
+      // 文件列表:已登记链接可见,未登记符号链接不可见
+      const filesHeaders = buildAuthHeaders('GET', '/api/files', Buffer.alloc(0), masterKey, deviceId);
+      const filesResponse = await fetch(`${baseUrl}/api/files`, { headers: filesHeaders });
+      const filesPayload = await filesResponse.json();
+      if (!filesResponse.ok) {
+        throw new Error(`Unexpected /api/files response: ${JSON.stringify(filesPayload)}`);
+      }
+      const tree = JSON.parse(decryptAesGcm(masterKey, filesPayload.encrypted).toString('utf8'));
+      const entriesByName = new Map(tree.map((entry) => [entry.name, entry]));
+      if (entriesByName.get('linked-file.txt')?.type !== 'file') {
+        throw new Error(`Registered file link missing from file list: ${JSON.stringify(tree)}`);
+      }
+      if (entriesByName.get('linked-dir')?.type !== 'dir'
+        || entriesByName.get('linked-dir/inner.txt')?.type !== 'file') {
+        throw new Error(`Registered dir link missing from file list: ${JSON.stringify(tree)}`);
+      }
+      if (entriesByName.has('secret-link.txt')) {
+        throw new Error('Unregistered symlink must not appear in file list');
+      }
+
+      // 下载链接文件,内容必须与源一致
+      const linkedFileContent = await downloadPlainFile(baseUrl, '/api/files/linked-file.txt', masterKey, deviceId);
+      if (linkedFileContent.toString('utf8') !== 'linked external file\n') {
+        throw new Error(`Linked file content mismatch: ${JSON.stringify(linkedFileContent.toString('utf8'))}`);
+      }
+
+      // 链接目录内的文件也可下载
+      const linkedInnerContent = await downloadPlainFile(baseUrl, '/api/files/linked-dir/inner.txt', masterKey, deviceId);
+      if (linkedInnerContent.toString('utf8') !== 'linked inner\n') {
+        throw new Error(`Linked dir inner content mismatch: ${JSON.stringify(linkedInnerContent.toString('utf8'))}`);
+      }
+
+      // 未登记符号链接:下载必须被拒绝(越界防护照旧生效)
+      const secretHeaders = buildAuthHeaders('GET', '/api/files/secret-link.txt', Buffer.alloc(0), masterKey, deviceId);
+      const secretResponse = await fetch(`${baseUrl}/api/files/secret-link.txt`, { headers: secretHeaders });
+      if (![403, 404].includes(secretResponse.status)) {
+        throw new Error(`Expected unregistered symlink download to be rejected, got ${secretResponse.status}`);
+      }
+
+      // 已登记链接可正常打包下载(跟随内容)
+      const linkArchiveBody = Buffer.from(JSON.stringify({ paths: ['linked-dir'] }));
+      const linkArchiveResponse = await fetch(`${baseUrl}/api/archive`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...buildAuthHeaders('POST', '/api/archive', linkArchiveBody, masterKey, deviceId),
+        },
+        body: linkArchiveBody,
+      });
+      if (!linkArchiveResponse.ok) {
+        throw new Error(`Archive over registered link failed with ${linkArchiveResponse.status}`);
+      }
+      if ((await linkArchiveResponse.arrayBuffer()).byteLength === 0) {
+        throw new Error('Archive over registered link was empty');
+      }
     }
 
     const archiveBody = Buffer.from(JSON.stringify({ paths: ['alpha.txt', 'docs'] }));

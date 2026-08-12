@@ -126,6 +126,14 @@ curl http://127.0.0.1:21891/healthz
 node share.js file1.pdf dir1 another.txt
 ```
 
+以符号链接方式共享（不复制文件，服务端只放行这些显式登记过的链接）：
+
+```bash
+node share.js --link /path/to/file1.pdf /path/to/dir1
+```
+
+链接项不会自动上传到云存储。跨平台注意：Linux/macOS 直接创建符号链接；Windows 上目录使用 junction（无需管理员权限），文件符号链接需要管理员权限或开发者模式，若无权限请改用上面的复制模式。
+
 查看当前共享文件：
 
 ```bash

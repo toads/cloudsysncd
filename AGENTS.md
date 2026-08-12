@@ -36,13 +36,14 @@
 ```
 server.js              # Express 服务端：配对、鉴权、文件/文本 API、管理接口
 pin.js                 # 本地 CLI：生成 PIN、查看/撤销已配对设备
-share.js               # 本地 CLI：复制文件到共享目录、列出/清空共享文件
+share.js               # 本地 CLI：复制文件到共享目录、软链接分享(--link)、列出/清空共享文件
 public/
   index.html           # 单页前端
   app.js               # 浏览器端逻辑：配对、文件浏览/下载、文本收发
 lib/
   cloud-storage.js     # 云存储抽象：R2/Qiniu 上传、Presigned URL、配额清理
   chunked-aead.js      # 流式分块加密格式实现
+  shared-links.js      # 软链接分享白名单(data/shared-links.json)读写与路径判断
 syncd_client/
   __init__.py          # Python 包入口
   cli.py               # Python 轮询下载客户端完整实现
